@@ -120,9 +120,7 @@ Developed at Aarhus University as part of the XtremeCT project, with AI
 assistance from the lab-deep and lab-coder models of the Natural Sciences
 AI Lab. If any issues arise, email marius.didziokas@chem.au.dk with a short
 description of the problem and the Dragonfly log (found under
-`%LOCALAPPDATA%\Comet\Dragonfly2025.1\logs`). The same note, prefixed with
-the plugin version, is pinned as a watermark line at the bottom of every
-notebook window.
+`%LOCALAPPDATA%\Comet\Dragonfly2025.1\logs`).
 
 ## Verifying a checkout (development)
 
