@@ -15,7 +15,7 @@ object's GUID or its title:
 
   * a GUID string is resolved first (``orsObj``) and matched exactly;
   * a title is matched against the representable objects of the expected
-    class (``getAllObjectsOfClass`` + ``getIsRepresentable``) — temporary /
+    class (``getAllObjectsOfClass`` + ``getIsRepresentable``) -- temporary /
     scratch objects are never pickable by title;
   * an ambiguous title raises a rename-first error listing every match's
     GUID (rename all but one, or pass the GUID);
@@ -27,7 +27,7 @@ object's GUID or its title:
   * a wrong-class object raises with the actual class named.
 
 Dtype policy (``publish_np_as_*``). ORS channels hold uint8, uint16, uint32
-or float32 data — ``createChannelFromNumpyArray`` re-initializes the target
+or float32 data -- ``createChannelFromNumpyArray`` re-initializes the target
 channel from the array's itemsize, and it silently shifts signed arrays by
 their minimum (a ``view`` + offset trick), which corrupts negative data. The
 conforming layer here therefore pins the output's own type before any ORS
@@ -48,33 +48,33 @@ call:
 Shape policy: 2-D arrays publish as single-slice volumes (Z=1); 1-D and >3-D
 arrays are refused. The shape of the published object comes from the array,
 never from the reference (the Fiber Tracer trap: ``copyShapeFromStructuredGrid``
-on a *populated* channel re-initializes the buffer in the template's type —
+on a *populated* channel re-initializes the buffer in the template's type --
 here shape is only ever copied onto an EMPTY channel, before the fill).
 
 Progress contract (``progress`` argument of the publish functions):
 
-  * ``True`` (default) — this module creates, starts, closes and deletes a
+  * ``True`` (default) -- this module creates, starts, closes and deletes a
     real ``ORSModel.ors.Progress`` (caption + ``step_count`` range,
     cancellable);
-  * ``None`` — silent, no progress object (the headless / test seam);
-  * a Progress object (real or duck-typed) — caller-owned: it is started
+  * ``None`` -- silent, no progress object (the headless / test seam);
+  * a Progress object (real or duck-typed) -- caller-owned: it is started
     best-effort (never twice) and never deleted by this module. The bridge
     service (round 8) hands the publish handlers a duck progress that
     forwards each step to the notebook application over the pipe, with
-    cancellation driven by the app's cancel frames — so the 3-step
+    cancellation driven by the app's cancel frames -- so the 3-step
     progress with its cancel checkpoints is preserved on the bridge path
     without ever opening a native ORS progress dialog.
 
 Each of the 3 steps runs ``getIsCancelled()`` exactly once, BEFORE its work
-(the plugin-canonical loop: check, work, ``updateProgress``) — so a cancel
+(the plugin-canonical loop: check, work, ``updateProgress``) -- so a cancel
 aborts before the next object is created or filled, and a completed step is
 never rolled back. A cancel raises ``RuntimeError('Operation cancelled by
 user.')`` and every scratch object is deleted. Duck-typed progress objects
 are never forwarded to native ORS calls (only real ``Progress`` instances
 are).
 
-The ``pump`` argument (round 8): the depth-0 hosts — the Dragonfly Python
-console, the launcher-driven publishes, direct API use — keep the per-step
+The ``pump`` argument (round 8): the depth-0 hosts -- the Dragonfly Python
+console, the launcher-driven publishes, direct API use -- keep the per-step
 event pump that keeps the progress dialog repainting; a notebook-originated
 bridge request runs with ``pump=False`` and NEVER pumps the event loop
 mid-handler (an unrestricted ``processEvents()`` on Dragonfly's GUI thread
@@ -117,7 +117,7 @@ _CANCEL_MESSAGE = 'Operation cancelled by user.'
 # ---------------------------------------------------------------------------
 
 def _class_label(expected_class):
-    """The human name used in every resolution error message — the Python
+    """The human name used in every resolution error message -- the Python
     class name (``getClassNameStatic`` returns the internal 'CxvChannel'
     spelling users never see)."""
     return getattr(expected_class, '__name__', 'object')
@@ -139,7 +139,7 @@ def _iter_instances_of(expected_class):
         expected_class.getClassNameStatic()))
 
 
-#: The classes dfnb addresses by title — the representable objects the
+#: The classes dfnb addresses by title -- the representable objects the
 #: Dragonfly UI offers. The cross-class resolution (``delete_object``) and
 #: the cross-class error scans enumerate exactly these, through the same
 #: per-class machinery ``list_objects`` uses.
@@ -147,8 +147,8 @@ _ADDRESSABLE_CLASSES = (Channel, ROI, MultiROI)
 
 
 def _grouped_class_counts(matches):
-    """The count-accurate class grouping of resolution matches —
-    ``'1 ROI, 2 MultiROIs'`` — sorted by class name; a count of 1 keeps the
+    """The count-accurate class grouping of resolution matches --
+    ``'1 ROI, 2 MultiROIs'`` -- sorted by class name; a count of 1 keeps the
     class name unpluralized the way the resolution messages do."""
     counts = {}
     for _obj, cls in matches:
@@ -161,7 +161,7 @@ def _grouped_class_counts(matches):
 
 def _title_carriers(text, expected_class):
     """Representable objects of the OTHER addressable classes carrying the
-    exact title — the cross-class scan behind the round-12 distinct
+    exact title -- the cross-class scan behind the round-12 distinct
     duplicate-name errors. Empty when nothing outside ``expected_class``
     carries the title (the generic no-object error then stays)."""
     carriers = []
@@ -181,7 +181,7 @@ def _title_carriers(text, expected_class):
 
 def _resolve(source, expected_class, expected_label):
     """Resolves ``source`` (instance | GUID string | title string) to an
-    object of ``expected_class`` — or, with ``expected_class=None``, to any
+    object of ``expected_class`` -- or, with ``expected_class=None``, to any
     representable object of the addressable classes (the cross-class
     resolution ``delete_object`` uses). Titles only match representable
     objects; GUIDs match any live object. Ambiguity and wrong classes
@@ -217,7 +217,7 @@ def _resolve(source, expected_class, expected_label):
         if expected_class is not None:
             _validate_class(by_guid, expected_class, expected_label, source)
         return by_guid
-    # Title search over the representable instances — of the expected class,
+    # Title search over the representable instances -- of the expected class,
     # or of every addressable class when none is given.
     if expected_class is None:
         candidates = [(obj, cls) for cls in _ADDRESSABLE_CLASSES
@@ -243,13 +243,13 @@ def _resolve(source, expected_class, expected_label):
                 f"open Dragonfly session.")
         if expected_class is not None:
             # the round-12 blind spot: the name DOES exist, on another
-            # class — name the carriers instead of the misleading generic
+            # class -- name the carriers instead of the misleading generic
             # no-object error
             carriers = _title_carriers(text, expected_class)
             if carriers:
                 label = _class_label(expected_class)
                 raise ValueError(
-                    f"No representable {label} is named {text!r} — that "
+                    f"No representable {label} is named {text!r} -- that "
                     f"name is carried by {_grouped_class_counts(carriers)}. "
                     f"Please rename the other object(s) or use the {label}'s "
                     f"own title or GUID.")
@@ -295,7 +295,7 @@ def list_objects(class_name='Channel', representable_only=True):
     :param class_name: an ORS class name, e.g. ``'Channel'``, ``'ROI'``,
         ``'MultiROI'`` (anything resolvable in ``ORSModel``).
     :param representable_only: when True (the default) temporary / scratch
-        objects are left out — those are exactly the ones the Dragonfly UI
+        objects are left out -- those are exactly the ones the Dragonfly UI
         offers, so they are the ones a title/GUID can address.
     :return: a list of ``{'guid': ..., 'title': ..., 'class_name': ...}``
         dicts sorted by title (then GUID).
@@ -325,7 +325,7 @@ def list_objects(class_name='Channel', representable_only=True):
 
 
 def delete_object(source):
-    """Deletes one object from the open Dragonfly session — notebook
+    """Deletes one object from the open Dragonfly session -- notebook
     housekeeping: a stale same-titled object from an earlier run can be
     removed before a new one is published with the same title.
 
@@ -368,7 +368,7 @@ def _conform_array_for_channel(array, what):
     ORS channel dtypes (uint8/uint16/uint32/float32) per the module dtype
     policy. Returns a C-contiguous copy safe to hand to
     ``createChannelFromNumpyArray`` (which silently shifts signed arrays by
-    their minimum — the conforming must never let one through)."""
+    their minimum -- the conforming must never let one through)."""
     a = np.asarray(array)
     if a.ndim not in (2, 3):
         raise ValueError(
@@ -395,14 +395,14 @@ def _conform_array_for_channel(array, what):
     else:
         raise ValueError(
             f"{what} has unsupported dtype {dtype}. Use one of uint8, "
-            f"uint16, uint32, float32 — or anything the dfnb dtype policy "
+            f"uint16, uint32, float32 -- or anything the dfnb dtype policy "
             f"converts (bool, float16/64, signed ints, uint64).")
     return np.ascontiguousarray(out)
 
 
 def _conform_labels_for_multiroi(array, what):
     """Validates a labels array (whole numbers, >= 0, at least one labeled
-    voxel) and routes its dtype by label count — the same routing
+    voxel) and routes its dtype by label count -- the same routing
     ``MultiROI.getAsNDArray`` uses, so an imported MultiROI re-publishes in
     its original dtype: <= 254 labels -> uint8, <= 65534 -> uint16,
     otherwise uint32 (never cast below what the largest label needs)."""
@@ -508,7 +508,7 @@ class _ProgressSession(object):
     """Normalizes the three-way progress contract into check/update pairs
     around each step's work: ``check()`` (exactly one ``getIsCancelled``)
     runs BEFORE the step's work, ``update()`` (one ``updateProgress``) after
-    it — a cancel therefore aborts before anything more is created.
+    it -- a cancel therefore aborts before anything more is created.
 
     ``pump=False`` (the bridge path) stands the per-step event pump down:
     a notebook-originated request never pumps Dragonfly's event loop."""
@@ -615,7 +615,7 @@ def import_volume_as_np(source, timestep=0):
 
     :param source: a Channel object, or its GUID, or its exact title.
     :param timestep: the timestep to read (0 on single-timestep volumes).
-    :return: a fresh ``numpy.ndarray`` — a real copy: editing it never edits
+    :return: a fresh ``numpy.ndarray`` -- a real copy: editing it never edits
         the Dragonfly volume.
     """
     channel = _resolve(source, Channel, 'Channel')
@@ -672,7 +672,7 @@ def publish_np_as_volume(array, title=None, reference=None, spacing=None,
         spacing. Without either, 1.0 isotropic.
     :param progress: ``True`` (default) | ``None`` | a Progress object.
     :param pump: when False (the bridge path) the per-step event pump is
-        stood down — a notebook-originated request never pumps events.
+        stood down -- a notebook-originated request never pumps events.
     :return: the new Channel (representable and published).
     """
     spacing = _check_spacing(spacing)
@@ -681,12 +681,12 @@ def publish_np_as_volume(array, title=None, reference=None, spacing=None,
     channel = None  # non-None only once tmp has become the kept result
     tmp = None
     try:
-        # step 1 — prepare: validate + conform the array, resolve the reference
+        # step 1 -- prepare: validate + conform the array, resolve the reference
         session.check()
         arr = _conform_array_for_channel(array, 'The volume array')
         reference_channel = _resolve_reference(reference, 'reference volume')
         session.update()
-        # step 2 — create the EMPTY output channel and give it the world
+        # step 2 -- create the EMPTY output channel and give it the world
         # geometry (on a populated channel copyShapeFromStructuredGrid would
         # re-initialize the buffer in the reference's type: the Fiber Tracer
         # trap)
@@ -695,7 +695,7 @@ def publish_np_as_volume(array, title=None, reference=None, spacing=None,
         if reference_channel is not None:
             tmp.copyShapeFromStructuredGrid(reference_channel)
         session.update()
-        # step 3 — write the voxel data and finalize
+        # step 3 -- write the voxel data and finalize
         session.check()
         createChannelFromNumpyArray(arr, channelGUID=tmp.getGUID(), ZAxis=True)
         _apply_spacing(tmp, spacing, reference_channel)
@@ -734,7 +734,7 @@ def publish_np_as_roi(array, title=None, reference=None, spacing=None,
     result = None  # non-None only once the ROI is titled and published
     tmp = None
     try:
-        # step 1 — prepare: validate + conform the mask, resolve the reference
+        # step 1 -- prepare: validate + conform the mask, resolve the reference
         session.check()
         mask = _conform_array_for_channel(array, 'The ROI mask')
         if not bool(mask.any()):
@@ -743,13 +743,13 @@ def publish_np_as_roi(array, title=None, reference=None, spacing=None,
                 '0); an empty ROI would not be created.')
         reference_channel = _resolve_reference(reference, 'reference volume')
         session.update()
-        # step 2 — scratch channel + world geometry
+        # step 2 -- scratch channel + world geometry
         session.check()
         tmp = Channel()
         if reference_channel is not None:
             tmp.copyShapeFromStructuredGrid(reference_channel)
         session.update()
-        # step 3 — fill the scratch channel and convert it to a ROI
+        # step 3 -- fill the scratch channel and convert it to a ROI
         session.check()
         createChannelFromNumpyArray(mask, channelGUID=tmp.getGUID(), ZAxis=True)
         _apply_spacing(tmp, spacing, reference_channel)
@@ -796,15 +796,15 @@ def publish_np_as_multiroi(array, title=None, reference=None, spacing=None,
     :param reference / spacing / progress / pump: as in
         ``publish_np_as_volume``.
     :param properties: optional measured properties written onto the fresh
-        MultiROI before it is returned — a ``pandas.DataFrame`` (one column
+        MultiROI before it is returned -- a ``pandas.DataFrame`` (one column
         per property) or a ``dict`` ``{name: array-like or {label: value}}``
-        (the per-region dict keyed by the labels 1..labelCount — see
+        (the per-region dict keyed by the labels 1..labelCount -- see
         ``export_measured_properties``); the same validation, auto-padding
         and name dedupe as ``export_measured_properties`` (a rejected call
-        raises ValueError and leaves NOTHING behind — the fresh MultiROI is
+        raises ValueError and leaves NOTHING behind -- the fresh MultiROI is
         deleted again). There is deliberately NO ``wipe`` parameter here:
         the write always lands on a FRESH 0-slot MultiROI, so a wipe would
-        be a no-op — replace-all only ever applies through
+        be a no-op -- replace-all only ever applies through
         ``export_measured_properties(wipe=True)`` onto an existing object.
     :return: the new MultiROI (representable and published).
     """
@@ -816,19 +816,19 @@ def publish_np_as_multiroi(array, title=None, reference=None, spacing=None,
     tmp = None
     label_count = 0
     try:
-        # step 1 — prepare: validate + route the labels, resolve the reference
+        # step 1 -- prepare: validate + route the labels, resolve the reference
         session.check()
         labels, label_count = _conform_labels_for_multiroi(
             array, 'The labels array')
         reference_channel = _resolve_reference(reference, 'reference volume')
         session.update()
-        # step 2 — scratch channel + world geometry
+        # step 2 -- scratch channel + world geometry
         session.check()
         tmp = Channel()
         if reference_channel is not None:
             tmp.copyShapeFromStructuredGrid(reference_channel)
         session.update()
-        # step 3 — fill the scratch channel and convert it to a MultiROI
+        # step 3 -- fill the scratch channel and convert it to a MultiROI
         # (the BounTI recipe)
         session.check()
         createChannelFromNumpyArray(labels, channelGUID=tmp.getGUID(),
@@ -892,8 +892,8 @@ def list_measured_properties(source, timestep=0):
 def import_measured_properties(source, properties=None, timestep=0):
     """Imports a MultiROI's measured properties as a ``pandas.DataFrame``.
 
-    One row per label slot — row 0 is the background slot Dragonfly
-    reserves, rows 1..N are labels 1..N — and one column per measured
+    One row per label slot -- row 0 is the background slot Dragonfly
+    reserves, rows 1..N are labels 1..N -- and one column per measured
     property. For the WRITE path (custom property names onto an existing
     or a freshly published MultiROI) see ``export_measured_properties``:
     ``MultiROI.setScalarValuesFromPandaDataFrame`` itself is broken in the
@@ -931,7 +931,7 @@ def import_measured_properties(source, properties=None, timestep=0):
 def _label_keyed_values(values, label_count, name):
     """A ``{label: value}`` column's values, in label order.
 
-    The natural cell-side shape for per-region measurements — a dict
+    The natural cell-side shape for per-region measurements -- a dict
     keyed by the label numbers 1..labelCount (one entry per region), the
     shape regionprops-driven cell code produces. Keys may be ints or
     anything ``int()`` maps onto the labels 1..N; any other key set is
@@ -963,13 +963,13 @@ def _normalize_property_columns(properties, label_count):
         order, row 0 = background); a duplicate column NAME is two
         properties (the write dedupes the slot names);
       * a ``dict`` ``{name: array-like}`` contributes one property per
-        key — and a column whose values are THEMSELVES a ``dict`` must
+        key -- and a column whose values are THEMSELVES a ``dict`` must
         map each label ``1..labelCount`` to one value (``_label_keyed_
         values`` orders them into a column);
       * anything else is a ValueError.
 
     Each column must carry ``label_count + 1`` values (index 0 = the
-    background row Dragonfly reserves) or exactly ``label_count`` values —
+    background row Dragonfly reserves) or exactly ``label_count`` values --
     the latter is auto-padded with a 0.0 background row in FRONT (rows
     1..N are labels 1..N). Empty / whitespace-only names are refused (an
     empty-name slot vanishes from the properties-pane comboboxes).
@@ -1025,12 +1025,12 @@ def _write_measured_properties(multiroi, properties, timestep, wipe=False):
     ``publish_np_as_multiroi(properties=...)``.
 
     The ORS write order (the shipped ScalarGenerator's proven pattern,
-    multiroibasicmeasurements.py:805-827 — MINUS its double
+    multiroibasicmeasurements.py:805-827 -- MINUS its double
     ``deleteObject``): for each property, GROW the slot count first (the
     slot count is global while descriptions/values are per (slot,
     timestep)), write the description, then the float64 values through
     ``ArrayHelper.ConvertNumpyToOrsArray`` (float64 -> ArrayDouble), and
-    delete the converted array immediately — ALWAYS exactly once. After
+    delete the converted array immediately -- ALWAYS exactly once. After
     all slots: ``setPropertyDirty()`` and
     ``OrsLabeledMultiRoiScalarValueHelper.initializeScalarValuesRangesFromValues``
     so the properties pane shows each column's min/max.
@@ -1038,7 +1038,7 @@ def _write_measured_properties(multiroi, properties, timestep, wipe=False):
     Two modes. ``wipe=False`` (default) is add-with-dedupe: the new
     columns JOIN the MultiROI's existing slots. ``wipe=True`` is
     replace-all: the measured-property slot set is reset to empty FIRST
-    (``multiroi.setScalarValuesSlotCount(0)`` — the round-10
+    (``multiroi.setScalarValuesSlotCount(0)`` -- the round-10
     probe-confirmed clean reset: grown slots shrink to 0 and a re-grown
     set's ``getScalarValuesAsPandaDataFrame`` readback shows ONLY the new
     columns, with the ranges helper working fine after the wipe), then
@@ -1046,7 +1046,7 @@ def _write_measured_properties(multiroi, properties, timestep, wipe=False):
 
     The reset happens only AFTER the pre-flight validation: everything is
     validated up front (see ``_normalize_property_columns``) and the
-    first ORS call — including the wipe — happens only when every column
+    first ORS call -- including the wipe -- happens only when every column
     passed, so a properties payload that fails validation can never
     destroy existing data (the nothing-is-written-if-any-column-fails
     contract). Duplicate names WITHIN the batch are deduped CSV-style
@@ -1059,7 +1059,7 @@ def _write_measured_properties(multiroi, properties, timestep, wipe=False):
     columns = _normalize_property_columns(properties, label_count)
 
     if wipe:
-        # after the reset there are no existing slots — the existing-
+        # after the reset there are no existing slots -- the existing-
         # descriptions read is skipped; in-batch duplicates still dedupe
         multiroi.setScalarValuesSlotCount(0)
         taken = set()
@@ -1099,7 +1099,7 @@ def _write_measured_properties(multiroi, properties, timestep, wipe=False):
 def export_measured_properties(source, properties, timestep=0, wipe=False):
     """Writes measured properties onto an EXISTING MultiROI.
 
-    Property names are plain strings — they do NOT have to come from
+    Property names are plain strings -- they do NOT have to come from
     vanilla Dragonfly's measured-properties menu (that list is only the UI
     menu; slots accept any name). This is the working write path: growing
     the slot count per property, writing the description and the float64
@@ -1109,7 +1109,7 @@ def export_measured_properties(source, properties, timestep=0, wipe=False):
 
     :param source: a MultiROI object, or its GUID, or its exact title.
     :param properties: a ``pandas.DataFrame`` (columns -> slot names, rows
-        0..labelCount) or a ``dict`` ``{name: values}`` — the values of
+        0..labelCount) or a ``dict`` ``{name: values}`` -- the values of
         one property may be any array-like (list / numpy array / pandas
         column) OR a ``dict`` ``{label: value}`` keyed by the labels
         1..labelCount (the per-region shape regionprops-driven cell code
@@ -1123,15 +1123,15 @@ def export_measured_properties(source, properties, timestep=0, wipe=False):
     :param wipe: ``False`` (default) adds the properties alongside the
         MultiROI's existing ones (add-with-dedupe). ``True`` is
         replace-all: the existing measured-property slot set is reset to
-        empty first (``setScalarValuesSlotCount(0)`` — the round-10
+        empty first (``setScalarValuesSlotCount(0)`` -- the round-10
         probe-confirmed clean reset) and the given properties are written
         as the ONLY ones. The reset runs only AFTER the validation: a
         payload that fails pre-flight raises with NOTHING written and the
         existing data untouched.
-    :return: None — the MultiROI is modified in place, so the generated
+    :return: None -- the MultiROI is modified in place, so the generated
         snippet is a bare call that echoes nothing into the cell.
     :raises ValueError: on an unresolvable source, a wrong class, or any
-        invalid column — with NOTHING written (the pre-flight runs before
+        invalid column -- with NOTHING written (the pre-flight runs before
         the first slot is grown and, under ``wipe=True``, before the
         reset).
     """
@@ -1156,7 +1156,7 @@ def export_measured_properties(source, properties, timestep=0, wipe=False):
 def _bridge_source_param(value, what):
     """Normalizes a bridge source/reference parameter into the string the
     resolvers accept: a ``{'guid', 'title', 'class_name'}`` published-object
-    handle (a previous ``publish_np_as_*`` result) contributes its GUID —
+    handle (a previous ``publish_np_as_*`` result) contributes its GUID --
     the precise handle; a plain string is its title or GUID."""
     if isinstance(value, dict):
         guid = str(value.get('guid') or '').strip()
@@ -1215,7 +1215,7 @@ def _bridge_publish(params, progress, function, property_key=None):
     drives the SAME 3-step progress / cancel checkpoints (each step is
     forwarded to the app as a progress event; a native ORS dialog is never
     created because a duck progress is never forwarded to native calls),
-    and ``pump=False`` stands the event pump down — the round-6 class stays
+    and ``pump=False`` stands the event pump down -- the round-6 class stays
     closed on the notebook path."""
     kwargs = {
         'array': params.get('array'),
@@ -1237,7 +1237,7 @@ def discard_bridge_object(guid):
     """Bridge-service seam: deletes the object a GUID designates. When a
     publish completed but its response could not be delivered (the
     application disconnected mid-request), the freshly published object
-    would otherwise linger in the session — this is the disconnect
+    would otherwise linger in the session -- this is the disconnect
     cleanup. Best-effort: a stale or already-deleted GUID is a no-op."""
     if not isinstance(guid, str) or not guid.strip():
         return

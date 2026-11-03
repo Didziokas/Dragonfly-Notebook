@@ -43,7 +43,23 @@ What is pinned:
   * ``restart()`` wipes the namespace IN PLACE and re-seeds dfnb: a
     variable defined before the restart raises NameError afterwards and
     the execution counter restarts at 1 (error outputs carry no
-    execution_count field -- the round-2 honest pins).
+    execution_count field -- the round-2 honest pins);
+  * round 16, custom environments: a kernel constructed with an
+    ``environment`` spawns the venv's OWN interpreter (the runner) on
+    its lazy start, takes the environment's in-use lock, and runs its
+    cells THERE: the marker package imports from the environment's
+    site-packages, sys.executable is the venv's interpreter (the
+    process boundary that replaced the in-process activation), a dfnb
+    call relays through the parent to the stub, the GUI thread stays
+    free, Stop interrupts a busy cell with a KeyboardInterrupt (the
+    child's namespace survives), restart wipes the runner's namespace,
+    and ``shutdown()`` + ``set_environment`` lands the next run on the
+    SECOND environment (its lock re-acquired, its marker bound), and
+    ``stop()`` (the window-close teardown) ends the live environment
+    child with its CLEAN quit -- exit 0, the in-use lock freed, never
+    the TerminateProcess fallback (the round-18 review pin: the quit
+    line used to be written after ``self._child`` was nulled, so it
+    raised into a bare except and every close hard-killed the child).
 
 TWO modes -- the first argument decides which build under test:
 
@@ -80,8 +96,11 @@ Run standalone (from the project root):
       verification/dfpy_ors.py verification/_kernel_smoke_helper.py
 """
 
+import importlib
 import os
+import shutil
 import sys
+import tempfile
 import time
 import types
 
@@ -220,11 +239,67 @@ class _RunCollector:
 
 # The pushed dfnb: a stub is enough for the ENGINE pins -- the real bridge
 # client crossing is pinned by the tier-2 loopback and the tier-3 spawn test.
+# list_objects returns what the real client method returns (the unwrapped
+# LIST of live-object dicts, not the handler's {'objects': ...} payload).
 _DFNB_STUB = types.SimpleNamespace(
-    list_objects=lambda *args, **kwargs: {'objects': []})
+    list_objects=lambda *args, **kwargs: [
+        {'guid': 'g-1', 'title': 't-1', 'class_name': 'Channel'}])
 
 kernel = kernel_mod.NotebookKernel(dfnb=_DFNB_STUB)
 collector = _RunCollector(kernel)
+
+# ---- round 16: the environment pins ride a SECOND kernel -------------------
+# The pins above stay on the embedded default; this kernel is constructed
+# with an explicit ``environment``, exactly the way the form constructs one
+# after a dropdown switch. Two minimal but RUNNABLE venv trees carry a
+# marker package each: ``pyvenv.cfg`` with ``home`` pointing at the
+# embedded distribution, a REAL copy of the stock interpreter in
+# ``Scripts`` (``embedded_python``: the manifest-clean exe the real
+# creation uses, so the fake tree behaves like a venv the ``venv`` module
+# built), and the marker in ``site-packages`` -- the shape
+# ``list_environments`` discovers AND the one the subprocess kernel can
+# actually EXECUTE, because the cells below run on those interpreters
+# for real. The paths are explicit, so no DFNB_ENVS_ROOT seam is needed
+# here, and the real venv CREATION / pip install subprocess runs are
+# pinned by tier 1 (the argv shapes) and tier 3 (the real runs through
+# the form). This helper pins the KERNEL side: the subprocess spawn, the
+# in-use lock, the dfnb relay, the stop, the restart, and the switch.
+# The import goes through the kernel's own package so ``envs_mod`` IS the
+# module whose in-use registry the worker writes to (its _in_use_fds).
+envs_mod = importlib.import_module(
+    kernel_mod.__name__.rsplit('.', 1)[0] + '.notebook_envs')
+
+
+def _make_fake_env(parent, name, tag):
+    """A minimal but RUNNABLE venv tree: ``pyvenv.cfg`` with ``home``
+    pointing at the embedded distribution (the venv's stdlib), a REAL
+    copy of the stock interpreter in ``Scripts``, and the marker package
+    in ``site-packages`` (the venv's own import path: nothing of the
+    embedded site-packages reaches the child, which is the point of the
+    subprocess model)."""
+    venv_dir = os.path.join(parent, name)
+    pkg_dir = os.path.join(envs_mod.venv_site_packages(venv_dir),
+                           'dfnb_smoke_pkg')
+    os.makedirs(pkg_dir)
+    with open(os.path.join(venv_dir, 'pyvenv.cfg'), 'w',
+              encoding='utf-8') as handle:
+        handle.write('home = {}\n'
+                     'include-system-site-packages = false\n'.format(
+                         os.path.dirname(envs_mod.embedded_python())))
+    with open(os.path.join(pkg_dir, '__init__.py'), 'w',
+              encoding='utf-8') as handle:
+        handle.write('WHICH = {!r}\n'.format(tag))
+    exe = envs_mod.venv_python(venv_dir)
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    shutil.copyfile(envs_mod.embedded_python(), exe)
+    return venv_dir
+
+
+_env_work = tempfile.mkdtemp(prefix='dfnb_smoke_envs_')
+_ENV_A = _make_fake_env(_env_work, 'envA', 'A')
+_ENV_B = _make_fake_env(_env_work, 'envB', 'B')
+env_kernel = kernel_mod.NotebookKernel(dfnb=_DFNB_STUB, environment=_ENV_A)
+env_collector = _RunCollector(env_kernel)
 
 try:
     assert kernel.is_started is False and kernel.is_running is False, \
@@ -465,15 +540,301 @@ try:
         "error outputs carry no execution_count field: {}".format(errors[0])
     print("PASS restart (namespace wiped, dfnb re-seeded, counter reset)",
           flush=True)
-finally:
+
+    # Round 16, environments -- the SECOND kernel: construction with an
+    # environment starts nothing (the lazy-start lifecycle holds); the
+    # first run spawns the venv's OWN interpreter with the runner, takes
+    # the in-use lock, and executes the cell THERE (the marker package
+    # binds from the environment's site-packages and sys.executable IS
+    # the venv's interpreter -- the process boundary that replaced the
+    # in-process activation); the dfnb stub answers a cell's call through
+    # the parent's relay; ``shutdown()`` stops the kernel WITHOUT the
+    # worker thread, so the lock frees and the next run lazy-starts
+    # fresh on the environment ``set_environment`` staged.
+    assert env_kernel.is_started is False and \
+        envs_mod.is_environment_in_use(_ENV_A) is False, \
+        ("construction with an environment must neither start the kernel "
+         "nor take its lock (the lazy-start lifecycle)")
+    count, outputs = env_collector.run(
+        'import dfnb_smoke_pkg, sys\n'
+        'print("ENVW", dfnb_smoke_pkg.WHICH, dfnb_smoke_pkg.__file__)\n'
+        'print("EXE", sys.executable)')
+    env_streams = [o for o in outputs if o["output_type"] == "stream"]
+    assert env_streams and env_streams[0]["text"].startswith("ENVW A ") and \
+        _ENV_A in env_streams[0]["text"], \
+        ("the marker package did not import from the first environment's "
+         "site-packages: {}".format(outputs))
+    # the child's two prints share ONE throttled stream line (the writer
+    # flushes at most once per 0.1 s), so the EXE line is PARSED out of
+    # the stream text instead of looked up as its own output
+    exe_value = None
+    for stream in env_streams:
+        for line in stream["text"].splitlines():
+            if line.startswith("EXE "):
+                exe_value = line
+    assert exe_value == "EXE {}".format(envs_mod.venv_python(_ENV_A)), \
+        ("the cell did not run on the venv's own interpreter: "
+         "{}".format(outputs))
+    assert env_kernel.active_environment == _ENV_A
+    assert envs_mod.is_environment_in_use(_ENV_A) is True, \
+        "the started kernel must hold its environment's in-use lock"
+    print("PASS environment spawn (marker from the venv's own "
+          "site-packages, sys.executable is the venv's interpreter, "
+          "in-use lock held)", flush=True)
+
+    # the dfnb relay: a cell's call crosses child -> parent -> stub and
+    # the answer comes back as the cell's execute_result (the stub
+    # returns the real client method's unwrapped list of object dicts)
+    count, outputs = env_collector.run("dfnb.list_objects()")
+    results = [o for o in outputs if o["output_type"] == "execute_result"]
+    assert results and results[0]["data"].get("text/plain") == \
+        "[{'guid': 'g-1', 'title': 't-1', 'class_name': 'Channel'}]", \
+        "the relayed dfnb call did not answer: {}".format(outputs)
+    print("PASS dfnb relay (list_objects crossed child -> parent -> stub)",
+          flush=True)
+
+    # the GUI thread stays free while an ENVIRONMENT cell runs: the
+    # worker only waits for the child's lines; the cell itself is
+    # another process entirely
+    ticks = []
+    timer = QTimer()
+    timer.setInterval(50)
+    timer.timeout.connect(lambda: ticks.append(time.monotonic()))
+    timer.start()
     try:
-        kernel.stop()
-    except Exception:
-        pass
+        count, outputs = env_collector.run('import time\ntime.sleep(1.0)\n'
+                                           'print("slept-env")')
+    finally:
+        timer.stop()
+    assert len(ticks) >= 10, \
+        ("the GUI thread must keep servicing timers while an environment "
+         "cell sleeps, got {} tick(s)".format(len(ticks)))
+    slept = [o for o in outputs if o["output_type"] == "stream"
+             and "slept-env" in o.get("text", "")]
+    assert slept, "the sleeping environment cell's print did not arrive"
+    print("PASS the GUI thread stayed free through an environment cell "
+          "({} QTimer ticks at 50 ms)".format(len(ticks)), flush=True)
+
+    # Stop: a busy environment cell interrupted from THIS (GUI) thread
+    # with exactly the Stop-button action -- kernel.request_stop() -- ends
+    # as a KeyboardInterrupt error output, never an engine failure, and
+    # the child's namespace survives the interrupt. (If the stop lands
+    # before the worker even starts the run it is forwarded at run start
+    # and the cell never runs; either path ends as a KeyboardInterrupt.)
+    env_collector.run('env_ki_probe = "alive"')
+    env_collector.count = None
+    env_collector.outputs = None
+    env_collector.failure = None
+    env_kernel.run_cell('total = 0\nfor i in range(30000000):\n'
+                        '    total += i')
+    env_kernel.request_stop()
+    assert _wait_until(
+        lambda: env_collector.count is not None or
+        env_collector.failure is not None,
+        60.0, "the stopped environment cell never finished"), \
+        "the stopped environment cell never finished"
+    assert env_collector.failure is None, \
+        "the stop surfaced as an engine failure: {!r}".format(
+            env_collector.failure)
+    errors = [o for o in (env_collector.outputs or [])
+              if o["output_type"] == "error"]
+    assert errors and errors[0]["ename"] == "KeyboardInterrupt", \
+        ("the stopped environment cell must end with a "
+         "KeyboardInterrupt, got {}".format(env_collector.outputs))
+    assert env_kernel.is_running is False, \
+        "the environment kernel must be idle again after the stop"
+    count, outputs = env_collector.run("env_ki_probe")
+    results = [o for o in outputs if o["output_type"] == "execute_result"]
+    assert results and results[0]["data"].get("text/plain") == "'alive'", \
+        ("the child's namespace must survive the interrupt: "
+         "{}".format(outputs))
+    print("PASS environment stop (request_stop() from the GUI thread "
+          "interrupted the busy cell; the namespace survived)",
+          flush=True)
+
+    # restart: the runner wipes its own namespace and counter and
+    # re-seeds dfnb (the child process itself stays; the pins that
+    # matter are the wipe, the re-seed and the counter reset)
+    env_collector.run('env_restart_probe = "abc"')
+    restart_box = {}
+    env_kernel.restart_finished.connect(
+        lambda ok, message: restart_box.update(ok=ok, message=message))
+    env_kernel.restart()
+    assert _wait_until(lambda: 'ok' in restart_box, 60.0,
+                      "the environment restart never finished"), \
+        "the environment restart never finished ({!r})".format(restart_box)
+    assert restart_box['ok'] is True, \
+        "the environment restart failed: {!r}".format(restart_box)
+    count, outputs = env_collector.run("dfnb is not None")
+    results = [o for o in outputs if o["output_type"] == "execute_result"]
+    assert results and results[0]["data"].get("text/plain") == "True", \
+        ("dfnb must be seeded after the environment restart: "
+         "{}".format(outputs))
+    assert count == 1, \
+        ("the environment restart resets the execution counter, got "
+         "{}".format(count))
+    count, outputs = env_collector.run("env_restart_probe")
+    errors = [o for o in outputs if o["output_type"] == "error"]
+    assert errors and errors[0]["ename"] == "NameError", \
+        ("a pre-restart variable must be gone after the environment "
+         "restart: {}".format(outputs))
+    print("PASS environment restart (runner namespace wiped, dfnb "
+          "re-seeded, counter reset)", flush=True)
+
+    # the switch seam: set_environment stages the SECOND venv, shutdown
+    # stops the child and frees the first lock, and the next run
+    # lazy-starts fresh on the second environment's interpreter
+    stopped_box = {}
+    env_kernel.kernel_stopped.connect(
+        lambda: stopped_box.update(stopped=True))
+    env_kernel.set_environment(_ENV_B)
+    env_kernel.shutdown()
+    assert _wait_until(lambda: stopped_box.get("stopped"), 60.0,
+                      "the shutdown never landed"), \
+        "shutdown() never stopped the kernel"
+    assert env_kernel.is_started is False, \
+        "shutdown() must leave the kernel stopped (the worker survives)"
+    assert envs_mod.is_environment_in_use(_ENV_A) is False, \
+        "the shutdown must release the first environment's lock"
+    count, outputs = env_collector.run(
+        'import dfnb_smoke_pkg, sys\n'
+        'print("ENVW", dfnb_smoke_pkg.WHICH, dfnb_smoke_pkg.__file__)\n'
+        'print("EXE", sys.executable)')
+    env_streams = [o for o in outputs if o["output_type"] == "stream"]
+    assert env_streams and env_streams[0]["text"].startswith("ENVW B ") and \
+        _ENV_B in env_streams[0]["text"], \
+        ("the second environment's marker must bind after the switch "
+         "(a fresh child on the second venv): {}".format(outputs))
+    exe_value = None
+    for stream in env_streams:
+        for line in stream["text"].splitlines():
+            if line.startswith("EXE "):
+                exe_value = line
+    assert exe_value == "EXE {}".format(envs_mod.venv_python(_ENV_B)), \
+        "the switched cell did not run on the second venv's interpreter"
+    assert env_kernel.active_environment == _ENV_B
+    assert envs_mod.is_environment_in_use(_ENV_B) is True, \
+        "the fresh start must hold the SECOND environment's lock"
+    print("PASS environment switch (shutdown freed the lock; the next run "
+          "spawned the SECOND venv's interpreter and took its lock)",
+          flush=True)
+
+    # round 17, the pump's stray-line tolerance: a cell writing straight
+    # to the REAL stdout (a shell-out that bypassed the ! helper, or any
+    # grandchild inheriting the handle) must surface as plain stream
+    # output instead of vanishing into the JSON channel, and the
+    # protocol must survive it and finish the cell normally
+    count, outputs = env_collector.run(
+        'import os\n'
+        'os.write(1, b"RAWLINE the grandchild spoke\\n")\n'
+        'os.write(1, b"RAWLINE two\\n")\n'
+        '"done"')
+    raw_lines = [o for o in outputs
+                 if o["output_type"] == "stream"
+                 and "RAWLINE" in o["text"]]
+    assert raw_lines and \
+        "the grandchild spoke" in raw_lines[0]["text"], \
+        ("a raw write on the child's stdout must surface as stream "
+         "output: {}".format(outputs))
+    results = [o for o in outputs if o["output_type"] == "execute_result"]
+    assert results, \
+        ("the JSON protocol must survive raw stdout writes: "
+         "{}".format(outputs))
+    print("PASS environment stray stdout (raw fd-1 writes relayed as "
+          "stream text; the JSON protocol survived and the cell finished)",
+          flush=True)
+
+    # round 17, the runtime DLL delivery on a REAL child: the kernel's
+    # start copied the SCAN-DISCOVERED misparked set into this venv's
+    # Scripts (ensure_runtime_dlls -- not name-keyed: the import tables
+    # of the base tree's extension modules decide, and on this machine
+    # that set heals sqlite3 AND tkinter alike) and the runner armed
+    # that directory for the dependent load, so the stdlib extension
+    # family imports inside the environment kernel (in a bare venv on
+    # this distribution sqlite3 and tkinter are DLL-load ImportErrors)
+    runtime_cell = (
+        'import bz2, ctypes, hashlib, lzma, select\n'
+        'import sqlite3, ssl, unicodedata, zlib\n'
+        'print("SMOKE-RT", sqlite3.connect(":memory:")\n'
+        '      .execute("select 41 + 1").fetchone()[0],\n'
+        '      ssl.OPENSSL_VERSION.split()[1],\n'
+        '      ctypes.sizeof(ctypes.c_void_p))')
+    if os.path.isfile(os.path.join(
+            os.path.dirname(envs_mod.venv_python(_ENV_B)),
+            'tcl86t.dll')):
+        runtime_cell += ('\nimport tkinter\n'
+                         'print("SMOKE-TK", tkinter.TkVersion)')
+    count, outputs = env_collector.run(runtime_cell)
+    streams = [o for o in outputs if o["output_type"] == "stream"]
+    errors = [o for o in outputs if o["output_type"] == "error"]
+    all_stream_text = "".join(o["text"] for o in streams)
+    assert streams and "SMOKE-RT 42" in all_stream_text \
+        and not errors, \
+        ("the environment child must import the stdlib extension family "
+         "and answer a sqlite query: {}".format(outputs))
+    if "SMOKE-TK" in runtime_cell:
+        assert "SMOKE-TK" in all_stream_text, \
+            ("tkinter (the set's second machine-misparked member, "
+             "tcl86t.dll) must import too: {}".format(outputs))
+    print("PASS environment runtime DLLs (the scan-discovered set + the "
+          "runner's directory arm made the stdlib extension family, "
+          "sqlite3 and tkinter included, import in the venv child)",
+          flush=True)
+
+    # round 18 review, the stop() quit pin: stop() (the window-close
+    # teardown) must deliver its documented best-effort QUIT to the
+    # live environment child, not silently fall through to the hard
+    # kill -- the old teardown nulled self._child BEFORE writing the
+    # quit line, so _child_write raised 'the environment kernel is not
+    # running' into the bare except, the two bounded waits ran out on
+    # the idle child (which sits in its command loop and never exits
+    # on its own) and TerminateProcess landed (exit 1). The clean quit
+    # (the runner's quit op, or its stdin-EOF _parent_gone exit) leaves
+    # exit code 0; a kill leaves 1 -- the returncode is the pin.
+    stop_child = env_kernel._child
+    assert stop_child is not None and stop_child.poll() is None, \
+        "the environment child must be alive right before the stop pin"
+    stop_t0 = time.monotonic()
+    env_kernel.stop()
+    stop_elapsed = time.monotonic() - stop_t0
+    assert env_kernel.is_started is False, \
+        "stop() must leave the kernel stopped"
+    assert stop_child.poll() is not None, \
+        "the environment child must be gone after stop()"
+    assert stop_child.returncode == 0, \
+        ("stop() must end the environment child with its CLEAN exit "
+         "(the quit op or the stdin-EOF fallback), never a "
+         "TerminateProcess kill: exit {}".format(stop_child.returncode))
+    assert envs_mod.is_environment_in_use(_ENV_B) is False, \
+        "stop() must free the environment's in-use lock"
+    assert stop_elapsed < 6.0, \
+        ("stop() must not wait out the full bounded-wait ladder on a "
+         "healthy child ({:.1f} s)".format(stop_elapsed))
+    print("PASS environment stop teardown (stop() delivered the clean "
+          "quit: exit 0, the in-use lock freed, {} ms)"
+          .format(int(stop_elapsed * 1000)), flush=True)
+except BaseException:
+    # The finally below stops the kernels, and that teardown can crash
+    # the process on this machine (the documented ORS teardown class) --
+    # which would swallow THIS traceback. Print the real failure first:
+    # a silent exit with no marker already means a failed gate, but a
+    # readable one costs nothing.
+    import traceback as _tb
+    _tb.print_exc()
+    raise
+finally:
+    for one in (env_kernel, kernel):
+        try:
+            one.stop()
+        except Exception:
+            pass
 
 print("KERNEL-SMOKE-OK (the engine pins on the worker-thread kernel: lazy "
       "start, 1+1, streams, stdin refusal, inline figure, dfnb seeded + "
       "orsObj a NameError, GUI-timer freedom through a sleeping cell, "
       "request_stop interrupt + heartbeat ticks + namespace survival, "
-      "queued stop, restart, localinterfaces rerouted off `ipconfig`)",
+      "queued stop, restart, localinterfaces rerouted off `ipconfig`, "
+      "environment subprocess spawn + dfnb relay + stop + restart + "
+      "shutdown switch + stray-stdout tolerance + the runtime DLL set + "
+      "the clean-quit stop teardown)",
       flush=True)

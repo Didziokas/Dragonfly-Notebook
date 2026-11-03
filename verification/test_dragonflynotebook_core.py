@@ -68,6 +68,23 @@ modules import no ORS code and no Dragonfly module):
     frame on the wire and a KeyboardInterrupt with the exact user-facing
     message in the calling thread).
 
+Round 16 added the custom Python environments (``notebook_envs``,
+pure stdlib): the name rules and discovery (only directories carrying
+pyvenv.cfg AND the venv interpreter count, sorted case-insensitively),
+the in-use lock (same-process refusal + a real CROSS-process hold that
+frees when the holding process exits, a stale marker file alone meaning
+nothing), the environment runners (``dfnb_env_kernel``, the JSON-line
+child the kernel spawns on the venv's own interpreter: the whole-cell
+interrupt guard that keeps a tail-of-cell stop from killing the child),
+the lazy-numpy proxies (no bind at import, the reset hook as a test
+seam -- pinned in a child process so a fake numpy never poisons this
+suite's own), and the long-run argv shapes plus the no-window
+bootstrap's runpy plumbing, run for real on cheap no-write commands.
+Cells actually RUNNING on an environment's interpreter (spawn, relay,
+stop, restart, switch) are the kernel smoke's environment pins; the
+REAL venv creation, a real OFFLINE pip install and the form-side UI
+rules are tier 3's section 10.
+
 Run (tier 1 is framework-free: straight on the embedded interpreter, no
 dfpy_ors launcher needed):
 
@@ -79,7 +96,10 @@ import importlib.util
 import json
 import keyword
 import os
+import re
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -144,8 +164,26 @@ if _ROOT not in sys.path:
 
 from DragonflyNotebook import notebook_bridge_protocol as protocol  # noqa: E402
 from DragonflyNotebook import dfnb_client as dfnb  # noqa: E402
+from DragonflyNotebook import notebook_envs as envs  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
+
+# Round 16: the suite's own children (the environment cases spawn a few)
+# run CREATE_NO_WINDOW'd, the round-14 convention: a console-less child
+# of this console-bearing gate would allocate its own visible console.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# Round 16: the children must also see a BARE interpreter. This suite
+# runs both standalone (tier 1: a clean shell environment) and imported
+# by the tier-2 suite INSIDE the dfpy_ors launcher, which sets PYTHONPATH
+# to Dragonfly's ORS tree (and QT_PLUGIN_PATH); a child inheriting those
+# runs the ORS auto-import chain at startup (its numpy bound before the
+# first line of -c code, the ORS console banner on its stdout). The same
+# two keys the app launcher strips for the notebook application process
+# (pinned by tier 3) are dropped here; notebook_envs.popen does the
+# identical scrub for the form's own long-run children.
+_CHILD_ENV = {key: value for key, value in os.environ.items()
+              if key not in ("PYTHONPATH", "QT_PLUGIN_PATH")}
 
 
 # ---------------------------------------------------------------------------
@@ -1313,6 +1351,871 @@ def case_client_cancel_mechanism_sends_cancel_frame_and_raises_interrupt():
           "calling thread")
 
 
+# ---------------------------------------------------------------------------
+# round 16: custom Python environments (notebook_envs, pure stdlib)
+# ---------------------------------------------------------------------------
+
+def case_envs_names_and_discovery_rules():
+    """Environment names and discovery: validate_name accepts letter/
+    digit/'.'/'_'/'-' names (stripped), refuses empties, bad characters
+    and collisions with an actionable message each; list_environments
+    counts only directories that carry pyvenv.cfg AND the venv
+    interpreter (a half-created or hand-dropped folder is skipped),
+    sorted case-insensitively."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, "envs")
+        os.makedirs(root)
+        assert envs.validate_name("scipy-lab", root) == "scipy-lab"
+        assert envs.validate_name("  padded  ", root) == "padded"
+        for bad, fragment in (
+                ("", "cannot be empty"),
+                ("   ", "cannot be empty"),
+                ("-leading", "may use letters"),
+                ("has space", "may use letters"),
+                ("sl/ash", "may use letters"),
+                ("x" * 65, "may use letters")):
+            try:
+                envs.validate_name(bad, root)
+                raise AssertionError("accepted {!r}".format(bad))
+            except ValueError as exc:
+                assert fragment in str(exc), (bad, str(exc))
+        os.makedirs(os.path.join(root, "taken"))
+        try:
+            envs.validate_name("taken", root)
+            raise AssertionError("collision accepted")
+        except ValueError as exc:
+            assert "already exists" in str(exc)
+
+        assert envs.list_environments(root) == []
+        # no pyvenv.cfg: skipped even though it looks like a venv
+        os.makedirs(os.path.join(root, "no_cfg", "Scripts"))
+        open(os.path.join(root, "no_cfg", "Scripts",
+                          os.path.basename(envs.venv_python("x"))),
+             "w").close()
+        # pyvenv.cfg but no interpreter: skipped (cannot run pip)
+        os.makedirs(os.path.join(root, "no_py"))
+        open(os.path.join(root, "no_py", "pyvenv.cfg"), "w").close()
+        for name in ("Beta", "alpha"):
+            good = os.path.join(root, name)
+            os.makedirs(os.path.join(good, "Scripts"))
+            open(os.path.join(good, "pyvenv.cfg"), "w").close()
+            open(envs.venv_python(good), "w").close()
+        assert envs.list_environments(root) == ["alpha", "Beta"], \
+            "valid environments, sorted case-insensitively"
+    print("  names: strip/accept/refuse (empty, characters, collision) "
+          "+ discovery skips cfg-less and interpreter-less dirs")
+
+
+def case_envs_in_use_lock_lifecycle():
+    """The in-use lock: acquire holds (the probe says so), a
+    same-process second acquire is refused with the actionable message,
+    release frees it, release without a hold is a False no-op. A stale
+    marker FILE alone (no lock) is NOT in use: the LOCK is the signal,
+    which is what makes the lock crash-safe (the OS frees it at process
+    exit). The CROSS-process half (another notebook window) is pinned
+    with a real second process that holds the lock for 3 s."""
+    with tempfile.TemporaryDirectory() as tmp:
+        venv = os.path.join(tmp, "envx")
+        os.makedirs(venv)
+        assert envs.is_environment_in_use(venv) is False
+        open(envs.in_use_marker_path(venv), "w").close()  # stale file
+        assert envs.is_environment_in_use(venv) is False, \
+            "the marker file alone must not mean in use"
+        envs.acquire_in_use(venv)
+        assert envs.is_environment_in_use(venv) is True
+        try:
+            envs.acquire_in_use(venv)
+            raise AssertionError("double acquire allowed")
+        except RuntimeError as exc:
+            assert "already in use in this notebook window" in str(exc)
+        assert envs.release_in_use(venv) is True
+        assert envs.is_environment_in_use(venv) is False
+        assert envs.release_in_use(venv) is False
+
+        # cross-process: a child holds the lock for 3 s; the parent's
+        # probe must see it held, and free again once the child exits
+        child_code = (
+            "import sys, time\n"
+            "sys.path.insert(0, {root!r})\n"
+            "from DragonflyNotebook import notebook_envs as ne\n"
+            "ne.acquire_in_use({venv!r})\n"
+            "print('HELD', flush=True)\n"
+            "time.sleep(3)\n").format(root=_ROOT, venv=venv)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child_code],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, text=True, env=_CHILD_ENV,
+            creationflags=_NO_WINDOW)
+        try:
+            first = proc.stdout.readline()
+            assert first.strip() == "HELD", first
+            assert envs.is_environment_in_use(venv) is True, \
+                "the child process's hold must be visible across processes"
+        finally:
+            proc.wait(30)
+        assert envs.is_environment_in_use(venv) is False, \
+            "the lock frees when the holding process exits (crash-safe)"
+    print("  lock: same-process refuse + cross-process hold via the OS "
+          "byte lock + release/exit frees it")
+
+
+def case_bridge_lazy_numpy_proxies_in_a_child():
+    """The lazy-numpy proxies (dfnb_client + protocol since round 16) in
+    a child process (a fake numpy at the front of sys.path must never
+    poison this suite's own numpy): the protocol module imports WITHOUT
+    numpy, the first np touch binds whatever the FRONT of sys.path
+    supplies, and reset_lazy_numpy re-arms the proxy so the next touch
+    re-imports instead of holding the bound module object. The proxies
+    order numpy after the DLL-directory registration; the
+    custom-environment cells no longer share this process's numpy at
+    all (they run in a subprocess on the venv's own interpreter), so
+    the proxy contract left to pin is exactly this binding discipline."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_site = os.path.join(tmp, "FakeSite")
+        fake = os.path.join(fake_site, "numpy")
+        os.makedirs(fake)
+        with open(os.path.join(fake, "__init__.py"), "w") as handle:
+            handle.write("MARK = 'FAKE'\n")
+
+        child_code = (
+            "import sys\n"
+            "sys.path.insert(0, {root!r})\n"
+            "sys.path.insert(0, {fake_site!r})\n"
+            "from DragonflyNotebook import notebook_bridge_protocol "
+            "as protocol\n"
+            "from DragonflyNotebook import dfnb_client\n"
+            "assert 'numpy' not in sys.modules, \\\n"
+            "    'protocol import must not bind numpy'\n"
+            "assert protocol.np.MARK == 'FAKE', \\\n"
+            "    'the first touch binds the front of sys.path'\n"
+            "import numpy\n"
+            "assert numpy is protocol.np, 'the proxy rebinds the global'\n"
+            "assert getattr(numpy, 'MARK', None) == 'FAKE'\n"
+            "protocol.reset_lazy_numpy()\n"
+            "dfnb_client.reset_lazy_numpy()\n"
+            "assert type(protocol.np).__name__ == '_LazyNumpy', \\\n"
+            "    'the protocol proxy was re-armed'\n"
+            "assert type(dfnb_client.np).__name__ == '_LazyNumpy', \\\n"
+            "    'the client proxy was re-armed too'\n"
+            "del sys.modules['numpy']  # the next touch must re-import\n"
+            "assert protocol.np.MARK == 'FAKE', \\\n"
+            "    'the re-armed touch re-imports rather than rebinding'\n"
+            "sys.path.remove({fake_site!r})\n"
+            "del sys.modules['numpy']\n"
+            "protocol.reset_lazy_numpy()\n"
+            "assert protocol.np.__version__  # the real numpy re-imports\n"
+            "import numpy as real\n"
+            "assert getattr(real, 'MARK', None) is None and \\\n"
+            "    hasattr(real, 'zeros')\n"
+            "print('CHILD-OK')\n").format(root=_ROOT, fake_site=fake_site)
+        proc = subprocess.run(
+            [sys.executable, "-c", child_code],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, text=True, timeout=120,
+            env=_CHILD_ENV, creationflags=_NO_WINDOW)
+        assert proc.returncode == 0, \
+            "the proxy child failed:\n{}".format(proc.stdout)
+        assert "CHILD-OK" in proc.stdout
+    print("  lazy numpy: no bind at import, first touch binds the front "
+          "of sys.path, reset re-arms, the next touch re-imports")
+
+
+def case_env_kernel_tail_stop_survives():
+    """The environment runner's whole-cell interrupt guard
+    (dfnb_env_kernel._execute): a stop armed at the TAIL of a cell --
+    after the guarded code region ended, while the epilogue still runs --
+    must end as one interrupted cell_done, never as a crash that takes
+    the child process and its namespace down (the round-16 review's P1).
+    Pinned in both placements: the interrupt landing inside the guarded
+    code region (the normal mid-cell stop) and one landing in the
+    epilogue (armed from _flush_figures, which runs after the guarded
+    region -- exactly the tail-of-cell race), then a plain run proving
+    the module still serves."""
+    import threading as _threading
+
+    from DragonflyNotebook import dfnb_env_kernel as env_kernel
+
+    class _Pipe:
+        def __init__(self):
+            self.lines = []
+        def write(self, text):
+            self.lines.append(text)
+        def flush(self):
+            pass
+
+    pipe = _Pipe()
+    saved_stdout = env_kernel._real_stdout
+    saved_count = env_kernel._execution_count
+    env_kernel._real_stdout = pipe
+    env_kernel._seed_ns()
+    env_kernel._ns['arm_here'] = (
+        lambda: env_kernel._arm_interrupt(_threading.get_ident()))
+    try:
+        # mid-cell placement: armed from inside the guarded code region
+        env_kernel._execute('arm_here()\n1 + 1')
+        events = [json.loads(line) for line in pipe.lines]
+        pipe.lines = []
+        assert [event['op'] for event in events] == ['error', 'cell_done'] \
+            and events[0]['ename'] == 'KeyboardInterrupt' \
+            and events[1]['interrupted'] is True, events
+
+        # epilogue placement: armed from _flush_figures (it runs AFTER
+        # the guarded region), so the interrupt lands between the
+        # regions -- the tail-of-cell race -- and must end the SAME way
+        real_flush = env_kernel._flush_figures
+
+        def flush_armer():
+            env_kernel._arm_interrupt(_threading.get_ident())
+
+        env_kernel._flush_figures = flush_armer
+        try:
+            env_kernel._execute('1 + 1')
+        finally:
+            env_kernel._flush_figures = real_flush
+        events = [json.loads(line) for line in pipe.lines]
+        pipe.lines = []
+        assert [event['op'] for event in events] == ['error', 'cell_done'] \
+            and events[0]['ename'] == 'KeyboardInterrupt' \
+            and events[1]['interrupted'] is True, events
+
+        # the module is still usable: a plain run produces its result
+        env_kernel._execute('2 + 2')
+        events = [json.loads(line) for line in pipe.lines]
+        pipe.lines = []
+        assert [event['op'] for event in events] == ['result', 'cell_done'] \
+            and events[0]['data']['text/plain'] == '4' \
+            and events[1]['interrupted'] is False, events
+    finally:
+        env_kernel._real_stdout = saved_stdout
+        env_kernel._execution_count = saved_count
+        env_kernel._seed_ns()
+    print("  tail stop: a stop armed at the cell's end ends as one "
+          "interrupted cell_done, the child and its namespace survive")
+
+
+def case_envs_creation_and_pip_argv_pins():
+    """The long-run argv shapes + the bootstrap's runpy plumbing for
+    real: venv_creation_command is the distribution's STOCK interpreter
+    (embedded_python: sys.base_prefix's python.exe, NOT sys.executable --
+    the notebook application runs as Dragonfly's licensed
+    pythonnoconsole.exe, and a venv COPIES the creating exe into Scripts,
+    where its QlmLicenseLib dependentAssembly cannot resolve: WinError
+    14001, observed live in round 16, probe-reproduced) with -c
+    <bootstrap> venv <dir> (the bootstrap patches the CHILD's Popen to
+    CREATE_NO_WINDOW and runpy-runs the module with argv[0] set);
+    pip_command (the pip button's field, round 17: the FULL command as
+    typed) and pip_install_command (its install contract, what the
+    creation flow's base install uses) run the VENV's python with
+    --no-input, the pip-version-check disabled, and the normalized
+    subcommand behind them (launcher spellings stripped, update run as
+    install --upgrade, uninstall auto-confirmed: --no-input turns pip's
+    confirmation question into a hard error, probe-proven on pip 23.0.1).
+    Both are then RUN for real through the bootstrap on cheap no-write
+    commands (venv --help, pip --version) to pin that the plumbing works
+    end to end. The real creation + a real offline install are pinned by
+    tier 3."""
+    bootstrap = envs.venv_creation_command(r"C:\nowhere\venv1")[2]
+    assert "0x08000000" in bootstrap and \
+        "subprocess.Popen.__init__" in bootstrap and \
+        'run_name="__main__"' in bootstrap
+
+    stock = envs.embedded_python()
+    assert stock == os.path.join(sys.base_prefix, "python.exe") and \
+        os.path.isfile(stock), stock
+    argv = envs.venv_creation_command(r"C:\nowhere\venv1")
+    assert argv[0] == stock
+    assert argv[1] == "-c" and argv[2] == bootstrap
+    assert argv[3] == "venv" and argv[4] == r"C:\nowhere\venv1"
+
+    venv = os.path.join(tempfile.gettempdir(), "dfnb_t1_pin_venv")
+    argv = envs.pip_install_command(venv, ["scipy", "scikit-image>=0.22"])
+    assert argv[0] == envs.venv_python(venv)
+    assert argv[1] == "-c" and argv[2] == bootstrap
+    assert argv[3:6] == ["pip", "--no-input",
+                         "--disable-pip-version-check"]
+    assert argv[6:] == ["install", "scipy", "scikit-image>=0.22"]
+
+    # the pip button's field: the FULL command as typed, every spelling
+    # normalized to the subcommand behind the fixed flags
+    def tail(command):
+        return envs.pip_command(venv, command)[3:]
+
+    assert tail("pip install yfinance") == \
+        ["pip", "--no-input", "--disable-pip-version-check",
+         "install", "yfinance"]
+    assert tail("pip3 list")[-1] == "list"
+    assert tail("pip3.11 install x") == \
+        ["pip", "--no-input", "--disable-pip-version-check",
+         "install", "x"]
+    assert tail("python -m pip install x")[-2:] == ["install", "x"]
+    assert tail("install numpy")[-2:] == ["install", "numpy"]
+    assert tail("pip update numpy")[-3:] == \
+        ["install", "--upgrade", "numpy"]
+    assert tail("pip upgrade numpy")[-3:] == \
+        ["install", "--upgrade", "numpy"]
+    assert tail("pip uninstall yfinance")[-3:] == \
+        ["uninstall", "yfinance", "-y"]
+    assert tail("pip uninstall -y yfinance")[-3:] == \
+        ["uninstall", "-y", "yfinance"]
+    assert tail("pip uninstall --yes yfinance")[-3:] == \
+        ["uninstall", "--yes", "yfinance"]
+    if os.name == "nt":
+        # the same nt split the runner uses: backslashes verbatim
+        # (posix splitting would hand pip C:wheelspkg.whl), quoted
+        # spans one word
+        assert tail('pip install "C:\\wheels\\pkg.whl"')[-2:] == \
+            ["install", "C:\\wheels\\pkg.whl"]
+    try:
+        envs.pip_command(venv, "pip")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a bare launcher must refuse (nothing to "
+                             "run)")
+
+    # the runpy plumbing, run for real: a usage text means the module
+    # executed as __main__ with argv[0] restored
+    proc = subprocess.run(
+        [sys.executable, "-c", bootstrap, "venv", "--help"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL, text=True, timeout=90,
+        env=_CHILD_ENV, creationflags=_NO_WINDOW)
+    assert proc.returncode == 0, proc.stdout
+    assert "usage" in proc.stdout.lower()
+    proc = subprocess.run(
+        [sys.executable, "-c", bootstrap, "pip", "--version"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL, text=True, timeout=90,
+        env=_CHILD_ENV, creationflags=_NO_WINDOW)
+    assert proc.returncode == 0, proc.stdout
+    assert "pip" in proc.stdout
+    print("  argv pins: -c bootstrap + module layout for venv and the "
+          "pip command builder, the full-command normalizations, run "
+          "for real on venv --help and pip --version")
+
+
+def case_env_kernel_cell_syntax_pins():
+    """The runner's cell syntax (round 17): ``!command`` lines rewrite
+    to the internal helper ONLY when plain parsing fails (a ``!``
+    inside a string literal is plain Python and must stay verbatim,
+    including inside an indented block); ``%`` magics are not rewritten
+    at all (``%pip`` included, round 17's rule: pip runs from the
+    toolbar's pip button, not from a cell) and get the explanatory
+    error naming both the embedded kernel and the button; a genuine
+    syntax error raises as itself."""
+    import ast as _ast
+
+    from DragonflyNotebook import dfnb_env_kernel as env_kernel
+
+    def rewritten_calls(code):
+        return [
+            (node.func.id, node.args[0].value)
+            for node in _ast.walk(env_kernel._parse_cell(code))
+            if isinstance(node, _ast.Call)
+            and isinstance(node.func, _ast.Name)
+            and node.func.id == '_dfnb_system']
+
+    # plain Python parses as itself
+    tree = env_kernel._parse_cell('1 + 1')
+    assert isinstance(tree, _ast.Module) and \
+        isinstance(tree.body[0].value, _ast.BinOp)
+
+    assert rewritten_calls('!dir /b\nx = 1') == \
+        [('_dfnb_system', 'dir /b')]
+    assert rewritten_calls('if True:\n    !echo hi\n') == \
+        [('_dfnb_system', 'echo hi')]
+
+    # a ! inside a string is plain Python: the string stays verbatim
+    code = 'text = """\n!not a command\n"""\nassert "!x" in "!x"'
+    constants = [
+        node.value for node in _ast.walk(env_kernel._parse_cell(code))
+        if isinstance(node, _ast.Constant) and isinstance(node.value, str)]
+    assert constants == ['\n!not a command\n', '!x', '!x'], constants
+
+    # every % magic -- pip included (round 17: pip runs from the
+    # button, never from a cell) -- gets the explanatory error, not a
+    # bare SyntaxError and never a rewrite
+    for magic in ('%pip install yfinance', '%pip3 list', '%pip',
+                  '%matplotlib inline'):
+        try:
+            env_kernel._parse_cell(magic)
+        except SyntaxError as exc:
+            assert 'magic' in str(exc) and 'pip' in str(exc) and \
+                'button' in str(exc), str(exc)
+        else:
+            raise AssertionError('the magic line parsed: ' + magic)
+
+    # a plain syntax error raises as itself
+    try:
+        env_kernel._parse_cell('1 +')
+    except SyntaxError:
+        pass
+    else:
+        raise AssertionError('the broken cell parsed')
+    print('  cell syntax: !command rewrites (strings verbatim), every '
+          '% magic explained -- pip included, pointed at the button, '
+          'never rewritten -- and syntax errors honest')
+
+
+def case_env_kernel_shell_escape_runs():
+    """The runner's ``!`` executed for real (round 17): ``!python -V``
+    reroutes to THIS interpreter (the venv's Scripts directory is never
+    on a notebook child's PATH, so a bare ``python`` word must not be a
+    PATH lookup) and its version line streams as cell output; pip is
+    REFUSED in cells (round 17's rule: pip runs only from the toolbar's
+    pip button): ``!pip --version`` and ``!python -m pip --version``
+    each complete with one clean cell_done, no error op, no spawned
+    child -- their whole output is the single stderr note naming the
+    button (offline commands -- no network)."""
+    from DragonflyNotebook import dfnb_env_kernel as env_kernel
+
+    class _Pipe:
+        def __init__(self):
+            self.lines = []
+
+        def write(self, text):
+            self.lines.append(text)
+
+        def flush(self):
+            pass
+
+    pipe = _Pipe()
+    saved_stdout = env_kernel._real_stdout
+    saved_count = env_kernel._execution_count
+    env_kernel._real_stdout = pipe
+    env_kernel._seed_ns()
+    try:
+        env_kernel._execute('!python -V')
+        events = [json.loads(line) for line in pipe.lines]
+        pipe.lines = []
+        assert events[-1]['op'] == 'cell_done' and \
+            events[-1]['interrupted'] is False and \
+            not [event for event in events if event['op'] == 'error'], \
+            events
+        text = ''.join(event.get('text', '') for event in events
+                       if event['op'] == 'stream')
+        assert text.strip().startswith('Python'), repr(text)
+
+        for refused in ('!pip --version', '!python -m pip --version'):
+            env_kernel._execute(refused)
+            events = [json.loads(line) for line in pipe.lines]
+            pipe.lines = []
+            assert events[-1]['op'] == 'cell_done' and \
+                events[-1]['interrupted'] is False and \
+                not [event for event in events
+                     if event['op'] == 'error'], (refused, events)
+            notes = [event for event in events
+                     if event['op'] == 'stream']
+            assert len(notes) == 1 and \
+                notes[0].get('name') == 'stderr' and \
+                'pip button' in notes[0].get('text', ''), (refused, notes)
+    finally:
+        env_kernel._real_stdout = saved_stdout
+        env_kernel._execution_count = saved_count
+        env_kernel._seed_ns()
+    print('  shell escapes: !python -V ran through the interpreter '
+          'reroute and streamed as cell output; !pip and !python -m pip '
+          'were refused -- one button note on stderr, nothing spawned')
+
+
+def case_env_kernel_polling_watch_dispatches():
+    """The round-17 Windows stdin watcher (``_watch_stdin_polling``):
+    a real pipe's lines dispatch exactly like the blocking reader did
+    (run lines to the command queue, stop latched between runs, dfnb
+    responses to their queue) and the writer closing ends the watcher
+    (PeekNamedPipe fails with ERROR_BROKEN_PIPE -- probe-proven, the
+    parent's death surfaces). The REASON the reader polls -- a blocked
+    ReadFile on the stdin pipe deadlocks a concurrent OpenBLAS-linked
+    DLL load, the user's stuck yfinance cell -- needs a real venv child
+    and is receipted live in the round, not in this process."""
+    import threading as _threading
+
+    from DragonflyNotebook import dfnb_env_kernel as env_kernel
+
+    read_fd, write_fd = os.pipe()
+    saved_pending = env_kernel._stop_pending
+    env_kernel._stop_pending = False
+    try:
+        os.write(write_fd, json.dumps(
+            {'op': 'run', 'code': 'pass'}).encode('ascii') + b'\n')
+        os.write(write_fd, json.dumps(
+            {'op': 'stop'}).encode('ascii') + b'\n')
+        os.write(write_fd, json.dumps(
+            {'op': 'dfnb_response', 'seq': 1, 'ok': True,
+             'result': None}).encode('ascii') + b'\n')
+        os.close(write_fd)
+        watcher = _threading.Thread(
+            target=env_kernel._watch_stdin_polling, args=(read_fd,),
+            daemon=True)
+        watcher.start()
+        watcher.join(10)
+        assert not watcher.is_alive(), \
+            'the watcher never returned (EOF not detected)'
+        assert env_kernel._stop_pending is True, 'the stop did not latch'
+        commands = []
+        while not env_kernel._commands.empty():
+            commands.append(env_kernel._commands.get_nowait())
+        responses = []
+        while not env_kernel._responses.empty():
+            responses.append(env_kernel._responses.get_nowait())
+        assert any(item['op'] == 'run' for item in commands), commands
+        assert responses and responses[0].get('seq') == 1, responses
+    finally:
+        os.close(read_fd)
+        env_kernel._stop_pending = saved_pending
+        while not env_kernel._commands.empty():
+            env_kernel._commands.get_nowait()
+        while not env_kernel._responses.empty():
+            env_kernel._responses.get_nowait()
+    print('  polling stdin watch: lines dispatched, stop latched, the '
+          'closed pipe ended the watcher')
+
+
+def case_envs_round17_contract_pins():
+    """Round 17's environment contract: BASE_PACKAGES is exactly numpy
+    and pandas (the minimum the notebook's own data paths need:
+    volumes cross as numpy arrays, measured properties as DataFrames),
+    the delete entry's label and sentinel exist, ensure_runtime_dlls
+    delivers the MACHINE'S misparked runtime DLL set into the venv's
+    Scripts -- scan-driven, not name-keyed (the import tables of the
+    base tree's extension modules, closed transitively, with API-set
+    names and the already-loaded python3*.dll family excluded; round
+    17's follow-up: a fix keyed to sqlite3.dll alone would miss
+    whatever a different build parks elsewhere -- this one also parks
+    tcl86t.dll, which broke tkinter) -- pinned against the machine's
+    real sqlite3.dll as the known instance and guarded for hosts
+    without the distribution, idempotent, and the runner arms its own
+    exe directory for dependent-DLL loads -- the copy and the arm are
+    BOTH required (probe-proven: a base-tree pyd's altered search never
+    reaches the exe dir on its own)."""
+    assert envs.BASE_PACKAGES == ('numpy', 'pandas'), envs.BASE_PACKAGES
+    assert envs.DELETE_ENV_LABEL == '- Delete Environment'
+    assert envs.DELETE_ENV_SENTINEL == '__dfnb_delete_environment__'
+
+    from DragonflyNotebook import dfnb_env_kernel as env_kernel
+    if os.name == 'nt':
+        assert env_kernel._OWN_DLL_DIR == os.path.dirname(
+            os.path.abspath(sys.executable)), env_kernel._OWN_DLL_DIR
+    else:
+        assert env_kernel._OWN_DLL_DIR is None, \
+            env_kernel._OWN_DLL_DIR
+
+    venv = os.path.join(tempfile.gettempdir(), 'dfnb_t1_dll_venv')
+    shutil.rmtree(venv, ignore_errors=True)
+    try:
+        base = envs._venv_base_prefix(venv)
+        expected = envs._missing_runtime_dlls(base)
+        envs.ensure_runtime_dlls(venv)
+        scripts = os.path.join(venv, 'Scripts')
+        if os.path.isdir(scripts):
+            delivered = {name for name in os.listdir(scripts)
+                         if name.lower().endswith('.dll')}
+        else:
+            delivered = set()
+        # every resolvable name the scan found is delivered, verbatim
+        # (and nothing else lands in Scripts)
+        assert delivered == {name for name, source in expected.items()
+                             if source is not None}, (
+            delivered, sorted(expected))
+        # the exclusions hold on whatever this machine found: no
+        # API-set name and no python3*.dll family member is copied
+        for name in delivered:
+            assert not name.lower().startswith(
+                ('api-ms-', 'ext-ms-')), name
+            assert not (name.lower().startswith('python')
+                        and name.lower().endswith('.dll')), name
+        # the known instance: this machine's real sqlite3.dll, verbatim
+        source = None
+        for runtime_dir in (os.path.join(base, 'Library', 'bin'),
+                             os.path.join(os.path.dirname(base), 'libs')):
+            candidate = os.path.join(runtime_dir, 'sqlite3.dll')
+            if os.path.isfile(candidate):
+                source = candidate
+                break
+        target = os.path.join(scripts, 'sqlite3.dll')
+        if source is not None:
+            assert os.path.isfile(target), target
+            assert os.path.getsize(target) == os.path.getsize(source)
+            # idempotent: a second call changes nothing and raises nothing
+            envs.ensure_runtime_dlls(venv)
+            assert os.path.getsize(target) == os.path.getsize(source)
+        else:
+            assert 'sqlite3.dll' not in delivered, \
+                'a DLL appeared without a source'
+    finally:
+        shutil.rmtree(venv, ignore_errors=True)
+    print('  round-17 contract: base packages numpy+pandas, the delete '
+          'entry, the scan-discovered runtime DLL set delivered into the '
+          'venv Scripts + the runner\'s own-directory arm')
+
+
+def case_env_kernel_stop_during_command():
+    """Round 17 review, the P0: a Stop that lands while a '!command'
+    cell runs must END the run interrupted -- the watcher's
+    one-shot async interrupt propagates out of _run_system_command
+    into _execute's existing guard (the swallowed version reported the
+    interrupted run as a clean completion while the cell's remaining
+    statements kept executing on). The command's own process is the
+    documented orphan -- and its forwarder is rebound to the drop
+    sink BEFORE the raise, so the orphan's late writes land nowhere,
+    never in a later run's outputs (the reviewer's misattribution
+    window)."""
+    from DragonflyNotebook import dfnb_env_kernel as env_kernel
+
+    released = threading.Event()
+    late_lines = []
+
+    class _FakeProc:
+        returncode = 0
+
+        def poll(self):
+            return None
+
+        @property
+        def stdout(self):
+            return _orphan_output()
+
+    def _orphan_output():
+        # the orphan prints ONLY after the interrupt (event-ordered:
+        # no sleep races in the critical path)
+        released.wait(5)
+        yield 'late line\n'
+
+    class _RecordingDrop(env_kernel._DropStream):
+        def write(self, data):
+            late_lines.append(data)
+
+    def _fake_popen(*args, **kwargs):
+        return _FakeProc()
+
+    def _raise_interrupt(seconds):
+        raise KeyboardInterrupt
+
+    saved_popen = env_kernel.subprocess.Popen
+    saved_sleep = env_kernel.time.sleep
+    saved_drop = env_kernel._DropStream
+    try:
+        env_kernel.subprocess.Popen = _fake_popen
+        env_kernel.time.sleep = _raise_interrupt
+        env_kernel._DropStream = _RecordingDrop
+        raised = False
+        try:
+            env_kernel._run_system_command('ping -n 100 localhost')
+        except KeyboardInterrupt:
+            raised = True
+    finally:
+        # restored BEFORE the grace wait below: time is a shared module,
+        # and the patched sleep would raise inside this very case
+        env_kernel.subprocess.Popen = saved_popen
+        env_kernel.time.sleep = saved_sleep
+        env_kernel._DropStream = saved_drop
+    assert raised, 'the interrupt must propagate out of the wait'
+    # the orphan prints now (the rebind happened inside the interrupt
+    # path, before the raise): the write must land in the drop sink,
+    # not in a live stream
+    released.set()
+    time.sleep(0.3)
+    assert late_lines == ['late line\n'], late_lines
+    print('  stop during !command: the interrupt propagates (the run '
+          'ends interrupted; the orphan\'s late writes land in the '
+          'drop sink)')
+
+
+def case_env_kernel_reroute_words_and_nt_paths():
+    """Round 17: the python reroute splits the command line WITHOUT
+    posix backslash-eating on Windows -- a '!python C:\\wheels\\pkg.py'
+    cell reroutes to this interpreter with the path VERBATIM (posix
+    splitting had handed it C:wheelspkg.py), a quoted span stays one
+    token with one matching quote pair stripped, 'python' reroutes to
+    sys.executable (casing and a '.exe' suffix alike) -- and PIP IS
+    REFUSED (round 17's rule: pip runs only from the toolbar's pip
+    button): every launcher spelling ('!pip install ...', '!pip3
+    ...', '!pip3.11 ...', '!python -m pip ...') PLUS the spellings a
+    case-exact check leaked to PATH (round 17 review: the shell
+    resolves names case-insensitively -- '!pip.exe', '!PIP', the
+    '!py -m pip' and '!py -3 -m pip' launcher shapes, and an
+    unquotable line whose first words are still a launcher) write the
+    button note to stderr and spawn NOTHING."""
+    from DragonflyNotebook import dfnb_env_kernel as env_kernel
+
+    class _FakeProc:
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        @property
+        def stdout(self):
+            return iter([])
+
+    captured = []
+    notes = []
+
+    class _ErrPipe:
+        def write(self, text):
+            notes.append(text)
+
+        def flush(self):
+            pass
+
+    def _fake_popen(*args, **kwargs):
+        captured.append(args[0])
+        return _FakeProc()
+
+    saved_popen = env_kernel.subprocess.Popen
+    saved_stderr = sys.stderr
+    try:
+        env_kernel.subprocess.Popen = _fake_popen
+        sys.stderr = _ErrPipe()
+        for refused in ('pip install C:\\wheels\\pkg.whl',
+                        'pip install "my pkg==1.0"',
+                        'pip3.11 list',
+                        'python -m pip install numpy',
+                        # the review's leaked spellings: casing, the
+                        # .exe suffix, the py launcher, and a line shlex
+                        # cannot split at all
+                        'pip.exe install x',
+                        'PIP install x',
+                        'py -m pip install x',
+                        'py -3 -m pip install numpy',
+                        'python.exe -m pip3 list',
+                        'pip install "unbalanced',
+                        # the unclosed quote BEFORE the launcher, the
+                        # shape _parse_cell hands over with its '!'
+                        # already stripped
+                        '"pip install x'):
+            captured_before = len(captured)
+            env_kernel._run_system_command(refused)
+            assert len(captured) == captured_before, \
+                (refused, captured[-1])
+        env_kernel._run_system_command('python -m timeit')
+        env_kernel._run_system_command('python C:\\wheels\\pkg.py')
+        env_kernel._run_system_command('python "my script.py" arg')
+        env_kernel._run_system_command('Python.exe -V')
+    finally:
+        env_kernel.subprocess.Popen = saved_popen
+        sys.stderr = saved_stderr
+    assert len(notes) == 11 and \
+        all('pip button' in note for note in notes), notes
+    assert len(captured) == 4, captured
+    first, second, third, fourth = captured
+    assert first == [sys.executable, '-m', 'timeit'], first
+    assert third == [sys.executable, 'my script.py', 'arg'], third
+    assert fourth == [sys.executable, '-V'], fourth
+    if os.name == 'nt':
+        assert second[0] == sys.executable and \
+            'C:\\wheels\\pkg.py' in second, second
+    print('  reroute words: every pip spelling (casing, .exe, py '
+          'launcher, unquotable) refused with the button note and no '
+          'spawn; nt paths verbatim, quoted spans whole, python '
+          'reroutes to sys.executable')
+
+
+def case_env_kernel_magic_mask_limitation():
+    """Round 17 review, the documented limitation: on a cell whose
+    plain parse fails, a '%' line that is really inside a multi-line
+    string reads as a magic line to the rewriter, so the explanatory
+    magic error MASKS the cell's real syntax error (here the broken
+    'def broken(:'). The pin documents today's behavior; the honest fix
+    needs error attribution on unparseable source."""
+    from DragonflyNotebook import dfnb_env_kernel as env_kernel
+    cell = 'note = """\n%time the timer\n"""\ndef broken(:'
+    raised = None
+    try:
+        env_kernel._parse_cell(cell)
+    except SyntaxError as exc:
+        raised = exc
+    assert raised is not None, 'the broken cell must raise'
+    assert 'magic' in str(raised) and 'pip' in str(raised), str(raised)
+    print('  magic-mask limitation: the multi-line string\'s % line '
+          'masks the real syntax error with the magic explanation '
+          '(documented in _parse_cell)')
+
+
+def case_text_contract_no_dashes_and_no_attribution():
+    """The permanent text contract over every committed text file: no em
+    dash (U+2014) and no en dash (U+2013) anywhere, and no phrase that
+    attributes a change to a person's request -- comments, docstrings
+    and README prose state the behavior and the rationale directly
+    instead. Scans DragonflyNotebook/*.py, README.md, Install.ps1,
+    LICENSE, .gitignore, examples/*.ipynb, docs/*.md and
+    verification/*.py (this file included) as UTF-8 and fails listing
+    every violation (file, line, fragment); the attribution check runs
+    per line and again over each file's text joined and
+    whitespace-normalized, so a phrase split across a line break is
+    caught too (the dash check stays per line)."""
+    # the phrases are assembled at runtime: this file is scanned too, so
+    # the banned literals must never appear in it verbatim
+    who = 'the use' + 'r'
+    banned_phrases = (
+        who + ' asked for', who + ' asked', who + ' asks',
+        who + "'s ask", who + ' requested', who + "'s request",
+        'user has ' + 'asked', 'i was ' + 'requested', 'based on the ' + 'request',
+        'per the ' + 'request', who + ' reported', who + "'s report",
+        who + "'s contract", who + "'s instruction", who + "'s word",
+        who + "'s go-ahead", who + "'s follow-up",
+        who + "'s clarification",
+        'requested by the ' + who, who + ' wanted',
+        'on the ' + who + "'s behalf",
+    )
+    targets = []
+    for entry in sorted(os.listdir(os.path.join(_ROOT, 'DragonflyNotebook'))):
+        if entry.endswith('.py'):
+            targets.append(os.path.join('DragonflyNotebook', entry))
+    targets.append('README.md')
+    targets.append('Install.ps1')
+    targets.append('LICENSE')
+    targets.append('.gitignore')
+    docs_dir = os.path.join(_ROOT, 'docs')
+    if os.path.isdir(docs_dir):
+        for entry in sorted(os.listdir(docs_dir)):
+            if entry.endswith('.md'):
+                targets.append(os.path.join('docs', entry))
+    for entry in sorted(os.listdir(os.path.join(_ROOT, 'examples'))):
+        if entry.endswith('.ipynb'):
+            targets.append(os.path.join('examples', entry))
+    for entry in sorted(os.listdir(_HERE)):
+        if entry.endswith('.py'):
+            targets.append(os.path.join('verification', entry))
+    violations = []
+    for relative in targets:
+        path = os.path.join(_ROOT, relative)
+        if not os.path.isfile(path):
+            continue
+        with open(path, 'r', encoding='utf-8') as handle:
+            lines = handle.read().splitlines()
+        seen_per_line = set()
+        for lineno, line in enumerate(lines, 1):
+            if '\u2014' in line or '\u2013' in line:
+                violations.append('{}:{}: em/en dash in {!r}'.format(
+                    relative, lineno, line.strip()[:120]))
+                continue
+            normalized = line.lower().replace('\u2019', "'")
+            for phrase in banned_phrases:
+                if phrase in normalized:
+                    seen_per_line.add(phrase)
+                    violations.append(
+                        '{}:{}: attribution phrase {!r} in {!r}'.format(
+                            relative, lineno, phrase, line.strip()[:120]))
+        # backstop: a phrase can hide across a line break, which the
+        # per-line scan never sees, so scan the whole text joined
+        joined_normalized = re.sub(
+            r'\s+', ' ', ' '.join(lines)).lower().replace('\u2019', "'")
+        for phrase in banned_phrases:
+            if phrase in joined_normalized and phrase not in seen_per_line:
+                start = joined_normalized.find(phrase)
+                fragment = joined_normalized[
+                    max(0, start - 60):start + len(phrase) + 60]
+                violations.append(
+                    '{}: attribution phrase {!r} in {!r} (may span a '
+                    'line break)'.format(relative, phrase, fragment))
+    assert not violations, \
+        'the text contract is violated:\n' + '\n'.join(violations)
+    print('  text contract: {} files scanned (DragonflyNotebook, README.md, '
+          'Install.ps1, LICENSE, .gitignore, examples, docs, verification); '
+          'no em/en dash, no attribution phrase'.format(len(targets)))
+
+
 CASES = (
     ("writer: fresh notebook is canonical nbformat 4.5 with the Dragonfly "
      "kernelspec",
@@ -1361,6 +2264,39 @@ CASES = (
      case_client_marshal_box_delivers_result_or_error),
     ("dfnb client: cancel mechanism (real cancel frame + interrupt)",
      case_client_cancel_mechanism_sends_cancel_frame_and_raises_interrupt),
+    ("environments: names + discovery rules",
+     case_envs_names_and_discovery_rules),
+    ("environments: the in-use lock (same process + cross process)",
+     case_envs_in_use_lock_lifecycle),
+    ("bridge lazy-numpy proxies: no bind at import, reset re-arms (child)",
+     case_bridge_lazy_numpy_proxies_in_a_child),
+    ("environment runner: a tail-of-cell stop ends interrupted, the "
+     "child survives",
+     case_env_kernel_tail_stop_survives),
+    ("environments: creation/pip argv pins + the bootstrap run for real",
+     case_envs_creation_and_pip_argv_pins),
+    ("environment runner: !command cell syntax, every % magic explained "
+     "(pip included)",
+     case_env_kernel_cell_syntax_pins),
+    ("environment runner: !python -V runs, !pip refused with the button "
+     "note",
+     case_env_kernel_shell_escape_runs),
+    ("environment runner: the polling stdin watch dispatches and ends",
+     case_env_kernel_polling_watch_dispatches),
+    ("environments: round-17 contract (base packages, delete entry, "
+     "the scan-discovered runtime DLL set)",
+     case_envs_round17_contract_pins),
+    ("environment runner: a Stop during !command propagates the "
+     "interrupt (the orphan stays)",
+     case_env_kernel_stop_during_command),
+    ("environment runner: reroute words keep nt paths verbatim; pip "
+     "refused with the button note",
+     case_env_kernel_reroute_words_and_nt_paths),
+    ("environment runner: the %magic-masks-syntax-error limitation",
+     case_env_kernel_magic_mask_limitation),
+    ("text contract: no em/en dash, no request attribution in any "
+     "committed text file",
+     case_text_contract_no_dashes_and_no_attribution),
 )
 
 

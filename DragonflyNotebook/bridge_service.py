@@ -8,14 +8,14 @@ process connects as its own client; the service
 * completes the version handshake (``hello`` -> ``welcome``),
 * decodes each ``request``'s parameters (arrays and DataFrames arrive
   materialized, via the shared protocol),
-* dispatches it to its handler table — ALWAYS on Dragonfly's GUI thread,
+* dispatches it to its handler table -- ALWAYS on Dragonfly's GUI thread,
   one request at a time (the safety invariant every round since 5 rests
   on: ORS object operations happen only on the GUI thread, and requests
   are serialized, never interleaved),
 * drives the handler's progress as ``progress`` frames toward the app and
   honors the app's ``cancel`` frames through a duck progress object the
   handlers already accept (the checkpoint pulls pending bytes with a
-  timed-out ``waitForReadyRead`` — probed on the shipped Qt: that moves
+  timed-out ``waitForReadyRead`` -- probed on the shipped Qt: that moves
   peer bytes into the buffer without running the event loop and without
   delivering queued slots, so no nested handler fires mid-pump),
 * writes its responses CHUNKED (``_WRITE_CHUNK`` bytes per event-loop
@@ -29,11 +29,11 @@ process connects as its own client; the service
 The service itself is ORS-free: it is constructed with a handler TABLE
 (a dict of method name -> ``handler(params, progress) -> payload``), which
 keeps it unit-testable in the framework-free tier with fake handlers. The
-cancellation path deserves its own note — it is the round-6 lesson in
+cancellation path deserves its own note -- it is the round-6 lesson in
 reverse: ``getIsCancelled`` during a handler pulls the socket's pending
-bytes SYNCHRONOUSLY (a timed-out ``waitForReadyRead`` + ``readAll`` — no
+bytes SYNCHRONOUSLY (a timed-out ``waitForReadyRead`` + ``readAll`` -- no
 event loop, and no queued-slot delivery, probed on the shipped Qt), so a
-cancel is seen mid-handler WITHOUT pumping Dragonfly's event loop — the
+cancel is seen mid-handler WITHOUT pumping Dragonfly's event loop -- the
 exact re-entrancy the round-6/7 crash class forbids. The notebook-originated
 requests additionally run with the handler's event pump stood down
 (``pump=False`` in the lib), so nothing on the notebook path ever opens a
@@ -238,11 +238,11 @@ class _BridgeConnection(QObject):
 
     def is_cancelled(self, request_id):
         """The handler's cancel checkpoint: pulls the socket's pending bytes
-        SYNCHRONOUSLY (no event loop — the round-6 rule). Probed on the
+        SYNCHRONOUSLY (no event loop -- the round-6 rule). Probed on the
         shipped Qt 6.7.1: ``readAll`` alone never sees peer bytes without an
         event-loop pass, but a timed-out ``waitForReadyRead`` moves pending
         pipe bytes into the socket's buffer WITHOUT running the event loop
-        and WITHOUT delivering queued slots or timers — so a cancel frame
+        and WITHOUT delivering queued slots or timers -- so a cancel frame
         that arrived mid-handler is honored at the very next checkpoint and
         no nested handler can fire mid-pump."""
         socket = self._socket
@@ -307,7 +307,7 @@ class _BridgeConnection(QObject):
     def abort(self):
         """Drops the connection: pending requests are discarded and the
         last recorded response payload (an abandoned publish) is deleted
-        through the discard hook — disconnect cleanup."""
+        through the discard hook -- disconnect cleanup."""
         self._cancelled.clear()
         self._pending = []
         self._outgoing = bytearray()
@@ -367,7 +367,7 @@ class NotebookBridgeService(QObject):
             self._last_payloads[id(connection)] = payload
 
     def clear_payload(self, connection):
-        """The connection's outgoing buffer fully drained — the payload was
+        """The connection's outgoing buffer fully drained -- the payload was
         delivered as far as this side can tell."""
         self._last_payloads.pop(id(connection), None)
 
@@ -400,8 +400,8 @@ class NotebookBridgeService(QObject):
             # A fast client can connect AND write its HELLO in the window
             # before this side processes the accept; readyRead does not
             # re-fire for bytes that were already buffered when the
-            # socket object was created. Feed whatever is buffered now —
-            # a plain read of arrived bytes, no event loop — so the
+            # socket object was created. Feed whatever is buffered now --
+            # a plain read of arrived bytes, no event loop -- so the
             # handshake never waits on a notification for old bytes.
             if socket.bytesAvailable() > 0:
                 connection._on_ready_read()

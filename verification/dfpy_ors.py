@@ -1,6 +1,6 @@
 """Launcher that runs a script with Dragonfly's bundled Python AND Dragonfly's
 Python code on the path (ORSModel etc.), plus the DLL directories Dragonfly
-uses — for probing how much of the ORS framework works outside the GUI app.
+uses -- for probing how much of the ORS framework works outside the GUI app.
 
 Same DLL caveat as dfpy.py: directories must be registered in-process.
 """

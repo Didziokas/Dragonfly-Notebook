@@ -17,6 +17,10 @@ output streaming.
 * A two-way bridge through the `dfnb` namespace: import volumes/ROIs/
   MultiROIs as numpy arrays, publish arrays back as Channels/ROIs/MultiROIs,
   read and write measured properties, list the live scene objects.
+* Optional private Python environments: select, create and delete them
+  from the toolbar's top-right environment field, pip install into the
+  selected one with its own pip, switch between it and the
+  embedded Python; the choice is saved with the notebook.
 * Toolbar snippet pickers: pick a Dragonfly object in a dialog and the exact
   `dfnb` call is inserted into the cell; every dialog follows Dragonfly's
   dark look.
@@ -24,6 +28,8 @@ output streaming.
   inline matplotlib figures, pygments highlighting.
 * Jupyter-style markdown cells: running one renders it in place, and a
   small edit button at its top-right flips it back to source.
+
+  ![A rendered markdown cell, with the edit button at its top right](docs/markdown-cell.png)
 * Drag a `.ipynb` from Windows Explorer onto the Dragonfly window (or onto
   an open notebook window) to open it.
 * Mid-run control: a busy bar in the status strip, the running cell's Run
@@ -101,6 +107,71 @@ through every interaction in five cells:
 
 Open the notebook by dropping it onto a notebook window (or via the
 toolbar's Open button) and run it top to bottom with Dragonfly open.
+
+## Custom Python environments
+
+Each notebook can run on its own virtual environment instead of the
+embedded Python, so packages Dragonfly's Python does not ship can be
+pip installed and imported in cells. The notebook window and the
+Dragonfly bridge always stay on the embedded Python; a notebook on a
+custom environment runs its cells in a separate kernel process on that
+environment's own Python and site-packages, so the two package sets
+never mix inside one interpreter.
+
+* Pick the environment in the toolbar's dropdown: click the environment
+  field at the TOP RIGHT of the notebook toolbar, the field labeled
+  'Dragonfly embedded Python' while the embedded interpreter is
+  selected. The dropdown is where environments are selected, created
+  ('+ New Environment') and deleted ('- Delete Environment'). The
+  default is the Dragonfly embedded Python (what notebooks used
+  before); the choice is saved with the notebook and restored on open.
+
+  ![The environment field with the dropdown open, next to the pip button](docs/environment-field.png)
+* '+ New Environment' in the dropdown opens a name field. Creation takes
+  about a minute and streams what is happening; a second streamed
+  install then puts the base packages in: numpy and pandas, the minimum
+  the notebook's data paths need (volumes cross as numpy arrays,
+  measured properties as pandas DataFrames).
+* The 'pip' button on the toolbar, active while a custom environment is
+  selected and nothing else of the window is running (a cell run or an
+  environment operation), is where pip runs: it is the only pip
+  interface -- type the full command (`pip install
+  yfinance`, `pip uninstall numpy`, `pip list`; a leading
+  `python -m pip` is tolerated, `pip update x` runs as
+  `pip install --upgrade x`, and an uninstall is confirmed
+  automatically) and the environment's own pip runs it, streaming its
+  output. A kernel left running on the environment does not lock the
+  button: it holds its DLLs loaded, so a pip command that replaces
+  them can fail with a Windows file-in-use error (the streamed dialog
+  shows pip's diagnostic; restarting the kernel first is the clean
+  path, and the button's tooltip carries the same note).
+* In environment cells, `!command` lines run as shell escapes: a bare
+  `python` means the environment's own interpreter. Pip does not run
+  from cells -- `!pip`, `%pip`, and `python -m pip` lines are refused
+  with a note pointing at the pip button -- and other `%` magics need
+  the embedded kernel.
+* '- Delete Environment' in the dropdown removes one environment from
+  disk after a confirmation. If the notebook's own kernel is running
+  on the environment, it is stopped first and the notebook switches
+  back to the embedded Python; an environment another notebook
+  window's kernel is using is refused (switch or close that window
+  first).
+* Switching the environment of a notebook whose kernel has run restarts
+  the kernel (one confirmation): the namespace is wiped, the notebook and
+  its cells are not touched.
+* `dfnb` calls work unchanged in environment cells: they cross to the
+  notebook application and on to Dragonfly, arrays included.
+* Environments live under `%LOCALAPPDATA%\DragonflyNotebook\environments`:
+  every environment is a full `python -m venv` tree under
+  `%LOCALAPPDATA%\DragonflyNotebook\environments\<name>`, and
+  '- Delete Environment' removes that whole tree from disk.
+  They also carry the distribution's runtime DLLs (copied in on
+  creation and at each kernel start, whatever the embedded distribution
+  parks outside the base tree), so the standard library itself, sqlite3
+  and tkinter included, imports inside them.
+
+Switching back to the embedded Python is always available in the
+dropdown.
 
 ## How it works
 

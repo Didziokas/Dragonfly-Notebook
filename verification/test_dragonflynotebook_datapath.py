@@ -16,7 +16,7 @@ synthetic in-memory fixtures built through ORS itself, every ORS object
 tracked and ``deleteObject()``-ed at teardown, and every pinned value read
 back through a DIFFERENT ORS path than the one under test. The lib is
 imported through the plugin package (``from DragonflyNotebook import
-dragonflynotebook_lib``) — the copy that ships, not a file-path twin.
+dragonflynotebook_lib``) -- the copy that ships, not a file-path twin.
 
 Pinned here:
 
@@ -31,7 +31,7 @@ Pinned here:
     only by ANOTHER class raises naming the carrying classes (round 12);
   * import_volume_as_np: (Z, Y, X) shape, the channel's dtype, values
     bitwise equal, and an INDEPENDENT copy (editing the returned array must
-    never write through to the volume — ``Channel.getNDArray`` returns a
+    never write through to the volume -- ``Channel.getNDArray`` returns a
     live view over the channel's raw memory);
   * import_roi_as_np / import_multiroi_as_np: uint8 mask / label-count
     routed dtype (<=254 labels -> uint8, up to 300 labels -> uint16 here),
@@ -47,14 +47,14 @@ Pinned here:
     dtype-trap rule: shape is only ever copied onto an EMPTY channel);
   * publish_np_as_roi: sizes and voxel content round-trip the mask bitwise,
     title set, an all-zero mask refused with no ORS object left behind;
-  * publish_np_as_multiroi: the BounTI recipe end to end — label count
+  * publish_np_as_multiroi: the BounTI recipe end to end -- label count
     pinned to the largest label (round-trip identity), content bitwise,
     dtype routed (3 labels -> uint8, 300 -> uint16), empty / fractional /
     negative labels refused;
   * a raise INSIDE publish() (the round-7 review closure, through the
     handler): it propagates out of the handler and the fresh
-    Channel/ROI/MultiROI is deleted — plus the scratch channel on the
-    ROI/MultiROI paths — pinned through duck-typed doubles in the
+    Channel/ROI/MultiROI is deleted -- plus the scratch channel on the
+    ROI/MultiROI paths -- pinned through duck-typed doubles in the
     Progress seam's __new__ spy pattern (the kept-result marker is
     assigned only after a successful publish, so the existing finally
     covers the publish-time raise with no new teardown);
@@ -68,15 +68,15 @@ Pinned here:
   * round 8, the structural pin replacing round 7's run-suppression case:
     notebook-originated requests reach the lib ONLY through the handler
     layer, and every publish handler calls its public function with a DUCK
-    progress (never ``True`` — no native ORS progress object is ever
+    progress (never ``True`` -- no native ORS progress object is ever
     constructed on the notebook path) and ``pump=False`` (the event pump
-    stands down — a bridge request never pumps Dragonfly's loop); the
+    stands down -- a bridge request never pumps Dragonfly's loop); the
     handle-to-GUID and label-key restoration are pinned on the same
     intercepted calls, plus the handler table's exact shape;
   * measured properties: list_measured_properties returns the slot
     descriptions in slot order; import_measured_properties returns a
     pandas.DataFrame with those columns and the fixture values (one row per
-    label slot — row 0 is the background slot Dragonfly reserves, rows
+    label slot -- row 0 is the background slot Dragonfly reserves, rows
     1..N are labels 1..N), honors a column subset in the given order, and
     refuses unknown columns listing the available ones;
   * measured-property WRITES (export_measured_properties +
@@ -90,8 +90,8 @@ Pinned here:
     against existing slots, and for duplicate DataFrame columns), every
     refusal (bad length, empty name, 2-D values, non-DataFrame/dict,
     0-based/partial/non-int/colliding {label: value} key sets,
-    wrong class, unresolvable source) happens PRE-FLIGHT — zero slots
-    added, zero objects created — and a publish whose properties are
+    wrong class, unresolvable source) happens PRE-FLIGHT -- zero slots
+    added, zero objects created -- and a publish whose properties are
     rejected leaves NO MultiROI and no scratch channel behind;
   * delete_object (the 11th function, round 12): the title and GUID forms
     delete a published object (gone from list_objects; the next by-title
@@ -103,7 +103,7 @@ Pinned here:
     representable_only=False still lists, unknown class names refused;
   * THE PIPE LOOPBACK (real QLocalServer + real DfnbClient in this one
     headless process): the exact framing, version handshake, chunked
-    transfer, error and progress envelopes the two processes use — real
+    transfer, error and progress envelopes the two processes use -- real
     arrays cross as npy bytes, a DataFrame crosses as column/index arrays,
     a published handle comes back and re-resolves, the dtype-trap rule
     holds across the pipe, an export with INT label keys lands after the
@@ -111,7 +111,7 @@ Pinned here:
     semantics cross the error envelope unchanged, progress frames arrive
     on the client callback, and a cancel frame sent mid-handler aborts the
     handler at its checkpoint with the exact RuntimeError (the checkpoint
-    pulls pending bytes with a timed-out waitForReadyRead — probed on the
+    pulls pending bytes with a timed-out waitForReadyRead -- probed on the
     shipped Qt: no event loop, no queued-slot delivery).
 
 FIRST, before any ORS work, the tier-1 core suite runs IN-PROCESS (import
@@ -248,7 +248,7 @@ def _roi_from(mask, title="probe_roi"):
 
 def _multiroi_with_properties(label_array, descriptions, columns, title):
     """A MultiROI fixture carrying measured properties: one scalar slot per
-    description, filled through ArrayHelper.ConvertNumpyToOrsArray — the
+    description, filled through ArrayHelper.ConvertNumpyToOrsArray -- the
     same path the ORS framework's own (broken) pandas setter uses, but on
     the working READ path only."""
     template = _channel_from(np.zeros(label_array.shape, np.uint16),
@@ -364,7 +364,7 @@ def case_bridge_source_resolution_pins_guid_title_and_handle_forms():
 
 def case_cross_class_title_raises_the_carrying_classes():
     """The round-12 blind spot: a title that exists ONLY on another class
-    no longer raises the misleading generic no-object error — the resolver
+    no longer raises the misleading generic no-object error -- the resolver
     names the classes that carry it ('No representable Channel is named ...
     that name is carried by 1 ROI'; the qualifier keeps the claim true even
     when a NON-representable same-class twin carries the title). The
@@ -454,7 +454,7 @@ def case_delete_object_removes_by_title_and_guid_and_refuses_unknown():
 
 def case_import_volume_as_np_returns_independent_z_y_x_copy():
     """import_volume_as_np through the bridge handler: (Z, Y, X) shape, the
-    channel's own dtype, values bitwise equal — and an independent
+    channel's own dtype, values bitwise equal -- and an independent
     numpy.ndarray: editing the returned array must not change the volume on
     re-import (Channel.getNDArray is a live view over the raw memory; the
     lib must copy). The timestep refusals fire in the lib exactly as
@@ -505,8 +505,8 @@ def case_import_roi_as_np_pins_binary_uint8_readout():
 
 def case_import_multiroi_as_np_pins_label_dtype_routing():
     """import_multiroi_as_np through the bridge handler: dtype routed by
-    label count exactly like Dragonfly's own MultiROI.getAsNDArray — <=254
-    labels -> uint8, and a 300-label MultiROI reads back as uint16 — with
+    label count exactly like Dragonfly's own MultiROI.getAsNDArray -- <=254
+    labels -> uint8, and a 300-label MultiROI reads back as uint16 -- with
     bitwise-equal values."""
     template = _channel_from(np.zeros(_LABELS.shape, np.uint16),
                              "tp_import_mroi_template")
@@ -539,7 +539,7 @@ def case_publish_np_as_volume_without_reference_pins_shape_dtype_spacing():
     publishes as Z=1), the values round-trip bitwise, an explicit spacing
     is pinned, and without one the spacing is 1.0 isotropic. Default title
     'Result volume'. The handler answers with the handle dict; the created
-    channel is read back through ``orsObj`` — a different path."""
+    channel is read back through ``orsObj`` -- a different path."""
     arr = np.arange(60, dtype=np.float32).reshape(3, 4, 5) + 0.5
     vol = _publish_via_bridge('publish_np_as_volume', {
         'array': arr, 'title': 'tp_pub_vol', 'reference': None,
@@ -579,7 +579,7 @@ def case_publish_np_as_volume_uint8_with_reference_pins_dtype_trap_rule():
     """The Fiber Tracer trap, pinned from the publish side through the
     handler (the reference crosses as a handle dict): an uint8 array
     published against a float32 reference keeps the ARRAY's dtype and shape
-    and inherits the reference's spacing — copyShapeFromStructuredGrid only
+    and inherits the reference's spacing -- copyShapeFromStructuredGrid only
     ever runs on the EMPTY output channel, before the fill."""
     reference = _channel_from(np.zeros((2, 3, 4), np.float32),
                               "tp_pub_ref_volume")
@@ -634,7 +634,7 @@ def case_publish_np_as_volume_dtype_policy_matrix():
     """The dtype policy, one handler publish per row, each value-checked
     through the ORS read path: float64->float32 (exact-representable
     values), bool->uint8, signed non-negative -> smallest uint, signed with
-    negatives -> float32 (values preserved — createChannelFromNumpyArray
+    negatives -> float32 (values preserved -- createChannelFromNumpyArray
     would otherwise shift them by the minimum), uint16 as-is, uint64 ->
     uint32 when it fits and ValueError when it does not; complex / 1-D /
     4-D / empty refused."""
@@ -798,8 +798,8 @@ def case_raise_inside_publish_leaves_nothing_behind():
     """The publish() call runs INSIDE the try of every publish function
     (the round-7 review closure), so it also holds one handler layer up:
     a failure raised INSIDE publish must propagate OUT of the handler AND
-    delete the fresh Channel/ROI/MultiROI — and, on the ROI/MultiROI paths,
-    the scratch channel too — because the kept-result marker
+    delete the fresh Channel/ROI/MultiROI -- and, on the ROI/MultiROI paths,
+    the scratch channel too -- because the kept-result marker
     (``channel``/``result``) is assigned only once the publish succeeded,
     so the existing ``finally`` conditions cover a publish-time raise with
     no new teardown. A real ORS object cannot be made to raise inside its
@@ -1013,8 +1013,8 @@ def case_bridge_requests_carry_duck_progress_and_pump_false():
     """Round 8's structural pin, replacing round 7's run-suppression case:
     notebook-originated requests reach the lib ONLY through the handler
     layer, and every publish handler calls its public function with a DUCK
-    progress — never ``True``, so no native ORS progress object is ever
-    constructed on the notebook path — and with ``pump=False``, so a
+    progress -- never ``True``, so no native ORS progress object is ever
+    constructed on the notebook path -- and with ``pump=False``, so a
     bridge request never pumps Dragonfly's event loop mid-handler. Pinned
     by intercepting the three public functions and reading the exact
     kwargs the handlers hand them, plus the duck-vs-native class rule and
@@ -1115,9 +1115,9 @@ def case_bridge_requests_carry_duck_progress_and_pump_false():
 def case_measured_properties_dataframe_and_columns():
     """list_measured_properties through the handler returns the slot
     descriptions in slot order; import_measured_properties returns a
-    pandas.DataFrame with those columns and the fixture values — one row
+    pandas.DataFrame with those columns and the fixture values -- one row
     per label slot (row 0 is the background slot Dragonfly reserves, rows
-    1..N are labels 1..N) —, honors a subset in the given order, and
+    1..N are labels 1..N), honors a subset in the given order, and
     refuses unknown columns listing the available ones."""
     mroi = _multiroi_with_properties(
         _PROPS_LABELS, ("Volume", "Mean intensity"),
@@ -1168,7 +1168,7 @@ def case_export_measured_properties_write_then_readback():
     the 0.0 background row in front; a {label: value} dict column
     (unordered int keys) lands in label order; the ranges helper
     initializes each slot's min/max to the written values; duplicate names
-    dedupe CSV-style ' (2)', ' (3)' — within a batch and against the
+    dedupe CSV-style ' (2)', ' (3)' -- within a batch and against the
     MultiROI's existing slots."""
     mroi = _multiroi_from(_channel_from(np.zeros(_PROPS_LABELS.shape, np.uint16),
                                         "tp_export_mroi_template"),
@@ -1269,7 +1269,7 @@ def case_export_measured_properties_write_then_readback():
         np.array_equal(frame_dup_out['A (2)'].to_numpy(),
                        [0.0, 11.0, 12.0, 13.0]), \
         "the two same-named columns keep their own values"
-    # a {label: value} dict write on a FRESH MultiROI — the per-region
+    # a {label: value} dict write on a FRESH MultiROI -- the per-region
     # shape regionprops-driven cell code produces ({1: v1, ..., N: vN},
     # unordered keys, int keys): ordered into a column by label, the 0.0
     # background row auto-padded in front
@@ -1310,7 +1310,7 @@ def case_export_measured_properties_preflight_refusals():
     unresolvable source raise ValueError with NOTHING written
     (slot count unchanged) and NOTHING created (MultiROI and Channel
     instance counts unchanged). Round 10: every shape is re-run with
-    wipe=True — still refused, AND the existing slot count, descriptions
+    wipe=True -- still refused, AND the existing slot count, descriptions
     and values untouched (the wipe reset runs only AFTER the pre-flight)."""
     mroi = _multiroi_from(_channel_from(np.zeros(_PROPS_LABELS.shape, np.uint16),
                                         "tp_preflight_mroi_template"),
@@ -1357,7 +1357,7 @@ def case_export_measured_properties_preflight_refusals():
         _export({'Named': {'a': 1.0, 'b': 2.0, 'c': 3.0}})
     _nothing_changed("non-int label keys")
     # int-colliding keys ('1' and 1) must not slip through as label 1
-    # twice — the exact-sequence key check is what catches them
+    # twice -- the exact-sequence key check is what catches them
     with _expect_value_error("maps each label 1..3"):
         _export({'Dup': {1: 1.0, '1': 2.0, 2: 3.0, 3: 4.0}})
     _nothing_changed("duplicate int-colliding label keys")
@@ -1383,7 +1383,7 @@ def case_export_measured_properties_preflight_refusals():
              'properties': {'A': [0.0, 1.0, 2.0, 3.0]}}, None)
     _nothing_changed("unresolvable source")
 
-    # round 10 — the no-data-loss contract under wipe: every refusal shape
+    # round 10 -- the no-data-loss contract under wipe: every refusal shape
     # above is re-run with wipe=True and must STILL raise AND leave the
     # slot set untouched. The reset (setScalarValuesSlotCount(0)) runs only
     # AFTER the pre-flight passes, so a failing payload can never destroy
@@ -1502,7 +1502,7 @@ def case_export_measured_properties_wipe():
         f"the add-mode baseline writes both columns, got {_listed()!r}"
     assert mroi.getScalarValuesSlotCount() == 2
 
-    # B under wipe=True: ONLY B survives — the old slot count, names and
+    # B under wipe=True: ONLY B survives -- the old slot count, names and
     # values are gone (the probe-confirmed clean reset)
     _export({'Perimeter': [7.0, 8.0, 9.0]}, wipe=True)
     listed = _listed()
@@ -1642,7 +1642,7 @@ def _ensure_qt_app():
     want one); reuses the process's instance when ORS made one. The
     CALLER must bind the returned wrapper: PyQt gives Python ownership of
     a parentless core application, and an unbound wrapper is destroyed by
-    the next GC — taking the event dispatcher (timers, queued signal
+    the next GC -- taking the event dispatcher (timers, queued signal
     delivery, the accept path) with it. Probed this window: the identical
     handshake passes with the wrapper bound and stalls within the first
     ``waitForReadyRead`` cycle when it is dropped."""
@@ -1653,7 +1653,7 @@ def _ensure_qt_app():
 
 
 def _pump_once():
-    """One bounded event-loop pass — the loopback's service side needs
+    """One bounded event-loop pass -- the loopback's service side needs
     loop turns to accept, read, execute and flush."""
     app = QCoreApplication.instance()
     if app is not None:
@@ -1663,7 +1663,7 @@ def _pump_once():
 def case_loopback_real_service_and_client_ship_arrays_and_tables():
     """End to end over the REAL pipe: a real ``NotebookBridgeService``
     (QLocalServer + the real ``BRIDGE_HANDLERS``) and a real ``DfnbClient``
-    in this same headless process — the exact framing, version handshake,
+    in this same headless process -- the exact framing, version handshake,
     chunked transfer, error and progress envelopes the two processes use.
     Real arrays cross as npy bytes, a DataFrame crosses as column/index
     arrays and comes back a real DataFrame, a published handle comes back
@@ -1674,7 +1674,7 @@ def case_loopback_real_service_and_client_ship_arrays_and_tables():
 
     The ``QCoreApplication`` MUST be bound to a local: PyQt gives Python
     ownership of a parentless core application, so discarding the wrapper
-    lets the next GC destroy the C++ app and its event dispatcher — the
+    lets the next GC destroy the C++ app and its event dispatcher -- the
     probed failure mode this window (the service's ``newConnection``
     queued delivery and every timer go silent and the handshake stalls).
     Binding it here keeps the dispatcher alive for the whole case."""
@@ -1733,7 +1733,7 @@ def case_loopback_real_service_and_client_ship_arrays_and_tables():
             'the values must cross bitwise'
 
         # the handle re-enters as a reference: the dtype-trap rule across
-        # the pipe (the array's dtype + shape, the REFERENCE's spacing —
+        # the pipe (the array's dtype + shape, the REFERENCE's spacing --
         # here the handle carries tp_loopback_pub's spacing)
         trap = (np.arange(60, dtype=np.uint8).reshape(3, 4, 5) % 7) * 30
         trap_handle = client.publish_np_as_volume(
@@ -1823,8 +1823,8 @@ def case_loopback_cancel_frame_aborts_a_running_handler():
     """The cancel path across the REAL pipe, without the app client (its
     queued-signal mechanics are tier-1-pinned): a raw protocol connection
     sends a request whose handler loops on the duck progress's
-    getIsCancelled() — sleeping and polling ONLY, no event loop (the
-    round-6 rule) — then sends a cancel frame mid-handler. The checkpoint
+    getIsCancelled() -- sleeping and polling ONLY, no event loop (the
+    round-6 rule) -- then sends a cancel frame mid-handler. The checkpoint
     pulls the pending bytes with a timed-out waitForReadyRead (probed on
     the shipped Qt: pending bytes move without the event loop and without
     delivering queued slots) and the handler aborts with the exact

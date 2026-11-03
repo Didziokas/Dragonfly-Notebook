@@ -98,7 +98,10 @@ plugin manager sees it (namespace package
       pushed dfnb, the ORS-free namespace, GUI-timer freedom through a
       sleeping cell, the request_stop interrupt, the queued stop (a stop
       requested before the run started still ends it interrupted, not as
-      an engine failure), restart;
+      an engine failure), restart, and the clean-quit stop teardown
+      (stop() ends the live environment child with exit 0 -- the quit
+      line the old teardown never delivered -- and frees the in-use
+      lock, never the TerminateProcess fallback);
   (9) round 10, the shipped example EXECUTED: the repo's
       examples/spheres_example.ipynb loaded through the shipped reader
       and the form's real open path (_load_notebook_document), every
@@ -108,7 +111,53 @@ plugin manager sees it (namespace package
       the three expected names (add mode on a fresh MultiROI), and the
       watershed separating exactly the 40 painted spheres (40 marker
       components, 40 labels -- the rejection-sampled generator's
-      guarantee).
+      guarantee);
+  (10) rounds 16+17, the custom python environments on a TEMP root
+      (DFNB_ENVS_ROOT, the seam notebook_envs.envs_root() honors): the
+      fresh combo (the embedded entry + the two administrative entries,
+      the pip button disabled with its reason in the tooltip), the
+      suppressed creation and delete picks under the suite seam (a log
+      record + revert each), the New Environment dialog's live name
+      validation, the REAL venv creation streamed through the
+      _EnvProcessDialog (start + event-loop pump, never exec), the
+      base-package install (round 17's second creation dialog) pinned
+      OFFLINE through a hand-built wheel, the user pick switching the
+      notebook (selection, metadata, label, the pip rule), a hand-built
+      wheel installed OFFLINE through the venv's own pip (the pip
+      button's FULL command text, round 17), a real cell
+      importing the wheel's package FROM the venv's site-packages while
+      the kernel holds the in-use lock (round 18: the pip button STAYS
+      ENABLED then, its tooltip carrying the file-in-use risk note --
+      the old in-use disable locked the button permanently after the
+      first cell run, and a restart could never clear it), a kernel
+      RESTART under the same hold (the button still enabled at
+      restart_finished), a
+      shell-escape cell ('!python -c ...') streaming the venv's own
+      interpreter path back, the stdlib extension family importing in
+      the venv child (round 17's scan-discovered runtime DLL copy + the
+      runner's directory arm -- sqlite3 and tkinter included), the
+      round-17 pip rule in the cells themselves ('%pip3 list' refused
+      with the explained magic error, '!pip3 list' refused with the
+      button note: pip runs only from the pip button, nothing
+      spawned), the switch back to embedded
+      auto-confirmed under test (kernel shut down, lock freed, metadata
+      dropped), the metadata round-trip through save + the open path,
+      the missing-environment fallback to the embedded Python (one log
+      record + a status note), the streaming dialog's close refusal
+      while a child runs, a pip failure surfacing pip's own diagnostic
+      through the exit code, the styled delete picker (round 18: the
+      QListWidget dialog on the plugin's dialog stylesheet, constructed
+      and pinned headless), and the delete flow: a hold this window
+      cannot stop (the direct lock, another window's stand-in) refuses,
+      the unselected delete removes only its own tree, and the
+      delete with THIS window's kernel running on the environment
+      (round 18) stops the kernel first, frees the lock, removes the
+      tree and silently switches back to the embedded Python, and the
+      spawn-failure path end to end (round 18 review: the venv's
+      interpreter deleted between the selection and the click -- no
+      exception escapes the pip slot, one status line, exactly one
+      'Dragonfly Notebook' log entry naming the OSError, the flag
+      dropped and the button re-enabled).
 
 ``DFNB_INSTALL_ROOT`` overrides the installed-root probe with one explicit
 data root: the pre-install staging seam. With install=false the suite can
@@ -164,12 +213,14 @@ import logging  # noqa: E402
 import math  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
+import shutil  # noqa: E402
 import subprocess  # noqa: E402
 import sys  # noqa: E402
 import tempfile  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
 import types  # noqa: E402
+import zipfile  # noqa: E402
 
 # Same multiple-OpenMP-runtime workaround as the core: MUST precede numpy,
 # so the ORS/libs OpenMP mix never aborts the process with 'OMP: Error #15'.
@@ -358,6 +409,7 @@ import pythonUserExtensions.Plugins.DragonflyNotebook.dragonflynotebook_core as 
 import pythonUserExtensions.Plugins.DragonflyNotebook.mainform_dragonflynotebook as installed_form  # noqa: E402
 import pythonUserExtensions.Plugins.DragonflyNotebook.notebook_cells as installed_cells  # noqa: E402
 import pythonUserExtensions.Plugins.DragonflyNotebook.notebook_drop_policy as installed_drop_policy  # noqa: E402
+import pythonUserExtensions.Plugins.DragonflyNotebook.notebook_envs as installed_envs  # noqa: E402
 
 # The installed sources must be the reviewed ones: sha256 against the
 # generated project's own files (a stale install is caught by hash, not by
@@ -367,13 +419,18 @@ import pythonUserExtensions.Plugins.DragonflyNotebook.notebook_drop_policy as in
 # (the app entry, the protocol, the notebook-side client, the service).
 # Round 9 adds the Qt-free .ipynb drop policy module (shared by the cell
 # editors, the form and the glue's application-level drop filter).
+# Round 16 adds the environment runner (dfnb_env_kernel.py: the script the
+# kernel spawns as a subprocess on a custom environment's own python --
+# the installed tree must carry it or every custom-environment cell dies
+# at spawn).
 package_dir = os.path.join(_ROOT, "DragonflyNotebook")
 SOURCE_FILES = ("__init__.py", "DragonflyNotebook.py",
                 "dragonflynotebook_core.py", "dragonflynotebook_lib.py",
                 "notebook_kernel.py", "notebook_cells.py",
                 "mainform_dragonflynotebook.py", "notebook_app.py",
                 "notebook_bridge_protocol.py", "dfnb_client.py",
-                "bridge_service.py", "notebook_drop_policy.py")
+                "bridge_service.py", "notebook_drop_policy.py",
+                "notebook_envs.py", "dfnb_env_kernel.py")
 for name in SOURCE_FILES:
     with open(os.path.join(package_dir, name), "rb") as handle:
         ref = hashlib.sha256(handle.read()).hexdigest()
@@ -909,7 +966,19 @@ try:
            "the EDIT flip restores the full chrome (run button, type "
            "label and accent bar visible, dfnb_rendered falsy on frame "
            "and browser)")
-    result(QApplication.focusWidget() is md_first["editor"],
+    # Round 16, the focus discipline: every focus pin below asserts the
+    # WINDOW's focus target (``form.focusWidget()`` -- the widget the
+    # flip's setFocus() armed, which receives the keyboard the moment the
+    # window is active), never ``QApplication.focusWidget()`` (the app-
+    # level focus exists only while the OS grants this process the
+    # foreground -- a desktop state the suite cannot control; on a live
+    # desktop with another application holding the foreground, Qt's
+    # optimistic activeWindow collapses at the first focus-widget
+    # deletion and every app-level pin dies with it, probe-confirmed).
+    # The user-facing contract is the window-level one: a human clicking
+    # the ✎ button HAS the window active, so the armed target IS the
+    # keyboard owner.
+    result(form.focusWidget() is md_first["editor"],
            "the ✎ Edit flip leaves the keyboard on the editor")
     result(md_first["editor"].toPlainText() == "# Modes heading",
            "the EDIT editor still carries the cell's source")
@@ -923,7 +992,7 @@ try:
            and not md_first["browser"].isHidden()
            and not md_first["edit_button"].isHidden()
            and "Modes heading" in md_first["browser"].toMarkdown()
-           and QApplication.focusWidget() is md_first["browser"],
+           and form.focusWidget() is md_first["browser"],
            "running the markdown cell renders it (editor hidden, browser "
            "re-set from the editor text, edit button back, focus ON the "
            "browser -- round 12 places it deterministically)")
@@ -944,7 +1013,7 @@ try:
            and form.document.get_cell(1)["source"] == "# Modes heading"
            and md_first["editor"].isHidden()
            and not md_first["browser"].isHidden()
-           and QApplication.focusWidget() is md_first["browser"],
+           and form.focusWidget() is md_first["browser"],
            "a Ctrl+Enter posted to the rendered browser does NOTHING (no "
            "run, no insert -- the browser consumes the chord)")
     # Round 13: Shift+Enter is the ONE chord that acts -- the filter still
@@ -964,7 +1033,7 @@ try:
            and md_first["editor"].isHidden()
            and not md_first["browser"].isHidden()
            and form._current_cell_index == 2
-           and QApplication.focusWidget() is form._cell_widgets[2]["editor"],
+           and form.focusWidget() is form._cell_widgets[2]["editor"],
            "a Shift+Enter posted to the rendered browser runs NOTHING but "
            "ADVANCES: the current cell becomes the next editable one (the "
            "code cell at 2 -- the rendered markdown is skipped) and its "
@@ -1041,7 +1110,7 @@ try:
     result(md_first["browser"].toMarkdown() == rendered_before
            and md_first["editor"].isHidden()
            and not md_first["browser"].isHidden()
-           and QApplication.focusWidget() is form._cell_widgets[2]["editor"],
+           and form.focusWidget() is form._cell_widgets[2]["editor"],
            "a repeat _run_cell_at on the rendered cell is a no-op (no "
            "re-render, still rendered; focus untouched on the advanced "
            "cell's editor -- round 13)")
@@ -1061,13 +1130,13 @@ try:
     QApplication.sendEvent(md_first["frame"], frame_press)
     app.processEvents()
     result(clicked == [True] and form._current_cell_index == 1
-           and QApplication.focusWidget() is md_first["browser"],
+           and form.focusWidget() is md_first["browser"],
            "a press on a rendered cell's frame emits frameClicked, selects "
            "the cell and focuses its browser")
     # An EDIT/code frame click only selects -- no focus steal.
     form._on_frame_clicked(0)
     result(form._current_cell_index == 0
-           and QApplication.focusWidget() is md_first["browser"],
+           and form.focusWidget() is md_first["browser"],
            "a frame click on a code cell only selects it (no focus steal "
            "from the rendered browser)")
 
@@ -1098,7 +1167,7 @@ try:
     # the survival pin below.
     form._run_cell_at(1, advance=True)
     app.processEvents()
-    result(QApplication.focusWidget() is form._cell_widgets[3]["editor"]
+    result(form.focusWidget() is form._cell_widgets[3]["editor"]
            and form._current_cell_index == 3,
            "Shift+Enter advancing from the EDIT markdown SKIPS the rendered "
            "markdown at 2 and lands on the next EDITABLE cell (the code "
@@ -1627,7 +1696,7 @@ try:
         "properties=props_df)"),
            "the generated publish-mode line is the publish call with the "
            "properties variable")
-    # round 10: the publish mode never carries a wipe — the checkbox lives
+    # round 10: the publish mode never carries a wipe -- the checkbox lives
     # only on the existing-mode page, so no publish parameter set (and no
     # publish line) can ever contain 'wipe'
     result("wipe" not in params_publish_mode and "wipe" not in line_publish_mode,
@@ -1684,7 +1753,8 @@ try:
            "the button-box rule covers both dialogs and the default "
            "button echoes the run button")
     # The leak guard: no BARE top-level type selector may exist in the
-    # constant -- every selector must name one of the two object names.
+    # constant -- every selector must name one of the scoped dialog
+    # object names (snippet, message, and round 16's env dialogs).
     # The regex keys on a type name followed only by optional blanks and
     # the opening brace: a scoped selector's '#' (QDialog#snippet_dialog)
     # blocks the match, a bare 'QLineEdit {' would match. The second pin
@@ -1700,10 +1770,11 @@ try:
     rule_lines = [line for line in dialog_sheet.splitlines() if "{" in line]
     result(bool(rule_lines) and all(
                line.lstrip().startswith(("QDialog#snippet_dialog",
+                                         "QDialog#env_dialog",
                                          "QMessageBox#dfnb_message"))
                for line in rule_lines),
-           "every one of the {} rule lines names #snippet_dialog or "
-           "#dfnb_message".format(len(rule_lines)))
+           "every one of the {} rule lines names #snippet_dialog, "
+           "#env_dialog or #dfnb_message".format(len(rule_lines)))
     # The message-box look: under running_in_test the failure paths log,
     # so the seam itself is pinned with a recording stub (the same
     # swap-and-restore convention the launcher's subprocess stub above
@@ -1846,7 +1917,7 @@ try:
            "the output browser keeps its dark surface with light text")
 
     # round 10: the footer watermark (the h5 importer's understated-footer
-    # convention) — an always-visible gray line as the LAST widget of the
+    # convention) -- an always-visible gray line as the LAST widget of the
     # outer layout, below the status strip, never emitted to log or box.
     watermark = form.findChild(QLabel, "watermark_label")
     result(watermark is not None,
@@ -2770,6 +2841,915 @@ try:
             example_service.close()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    print("\n=== (10) rounds 16+17: the custom python environments ===",
+          flush=True)
+
+    # The feature runs against a TEMP environments root: DFNB_ENVS_ROOT is
+    # the seam notebook_envs.envs_root() honors, so no venv is created and
+    # no pip install writes anywhere outside the suite's temp tree. It is
+    # set BEFORE the form's construction (the form captures envs_root() at
+    # its ctor; every list/validate/create below must resolve the same
+    # root). NOT covered here, on purpose: the modal exec() runs of the
+    # streaming dialogs (the _EnvProcessDialog machinery is driven
+    # directly through start + event-loop pump, the same headless
+    # convention as the picker dialogs of section 4), the live
+    # pip-install button handler (its spec dialog is modal too; the
+    # command it would run is the one pinned below) and the delete
+    # picker + confirm (their suppression seam is pinned below; the
+    # removal itself is driven directly).
+    envs_root_dir = tempfile.mkdtemp(prefix="dfnb_t3_envs_")
+    os.environ["DFNB_ENVS_ROOT"] = envs_root_dir
+    result(installed_envs.envs_root() == envs_root_dir,
+           "DFNB_ENVS_ROOT points notebook_envs at the suite's temp root")
+
+    # A third service with an explicit pipe name (the pid-suffixed default
+    # is still held by the section-3 service, and the example section owns
+    # its own): this form's client connects to it exactly the way each
+    # section's form does.
+    env_service = installed_bridge.NotebookBridgeService(
+        dict(installed_lib.BRIDGE_HANDLERS),
+        pipe_name="dfnb_bridge_envs_tier3",
+        discard_hook=installed_lib.discard_bridge_object)
+    result(env_service.is_listening,
+           "the environments section's bridge service listens on {}"
+           .format(env_service.pipe_name))
+
+    def _wait_env_dialog(dialog, what, timeout_s=180.0):
+        # The _EnvProcessDialog contract the suite drives: start() spawns
+        # the no-window child, the reader thread forwards the lines and
+        # the exit code through queued signals, and pumping the event
+        # loop delivers them (exec() is never called here).
+        deadline = time.monotonic() + timeout_s
+        while dialog.exit_code is None:
+            if time.monotonic() > deadline:
+                result(False, "{} did not finish within {} s (transcript "
+                              "tail: {!r})".format(
+                                  what, timeout_s,
+                                  "\n".join(dialog.transcript[-8:])))
+            app.processEvents()
+            time.sleep(0.02)
+        for _ in range(5):
+            app.processEvents()
+            time.sleep(0.02)
+
+    env_form = None
+    try:
+        env_form = installed_form.DragonflyNotebookForm(
+            pipe_name=env_service.pipe_name)
+        env_form.show()
+        app.processEvents()
+        result(env_form.client.is_connected(),
+               "the environments form's bridge client connected")
+
+        # A fresh form on an EMPTY environments root: the combo carries
+        # exactly the embedded entry and the two administrative entries
+        # (no separator when no environment exists yet), the embedded
+        # Python is selected by default, and the pip button is disabled
+        # with its reason.
+        env_combo = env_form._env_combo
+        fresh_items = [env_combo.itemText(i)
+                       for i in range(env_combo.count())]
+        result(fresh_items == [installed_envs.EMBEDDED_LABEL,
+                               installed_envs.NEW_ENV_LABEL,
+                               installed_envs.DELETE_ENV_LABEL],
+               "the fresh combo carries the embedded entry and the two "
+               "administrative entries only: {}".format(fresh_items))
+        result(env_combo.currentData() is None
+               and env_form._selected_environment is None,
+               "the embedded Python is the default selection")
+        result(env_form._pip_button.isEnabled() is False
+               and "not pip-installable" in env_form._pip_button.toolTip(),
+               "the pip button is disabled on the embedded Python with "
+               "the reason in its tooltip: {!r}".format(
+                   env_form._pip_button.toolTip()))
+        result(env_form._env_label.text() ==
+                "env: {}".format(installed_envs.EMBEDDED_LABEL),
+               "the status strip names the environment: {!r}".format(
+                   env_form._env_label.text()))
+        result(env_combo.isEnabled(),
+               "the combo is enabled while idle")
+
+        # The '+ New Environment' entry under the suite seam: the
+        # programmatic pick reaches the handler, the modal creation flow is
+        # suppressed (running_in_test), the combo reverts to the current
+        # selection, and the suppression is a LOG record.
+        sentinel_index = env_combo.findData(installed_envs.NEW_ENV_SENTINEL)
+        suppress_log = _RecordingLogHandler()
+        form_logger.addHandler(suppress_log)
+        try:
+            env_combo.setCurrentIndex(sentinel_index)
+        finally:
+            form_logger.removeHandler(suppress_log)
+        result(env_combo.currentIndex() == 0,
+               "the suppressed creation pick reverted the combo to the "
+               "embedded entry")
+        result(len(suppress_log.records) == 1
+               and "suppressed under test" in suppress_log.records[0],
+               "the suppression logged exactly one record ({} entries)"
+               .format(len(suppress_log.records)))
+
+        # The '- Delete Environment' entry under the same seam (round
+        # 17): the pick reverts and logs; the picker dialog itself never
+        # opens headless.
+        delete_index = env_combo.findData(
+            installed_envs.DELETE_ENV_SENTINEL)
+        delete_log = _RecordingLogHandler()
+        form_logger.addHandler(delete_log)
+        try:
+            env_combo.setCurrentIndex(delete_index)
+        finally:
+            form_logger.removeHandler(delete_log)
+        result(env_combo.currentIndex() == 0,
+               "the suppressed delete pick reverted the combo to the "
+               "embedded entry")
+        result(len(delete_log.records) == 1
+               and "delete-environment dialog is suppressed under test"
+               in delete_log.records[0],
+               "the delete suppression logged exactly one record ({} "
+               "entries)".format(len(delete_log.records)))
+
+        # The New Environment dialog, headless: its live validation mirrors
+        # notebook_envs.validate_name (the reason under the field, OK
+        # disabled until valid).
+        new_dialog = installed_form.NewEnvironmentDialog(envs_root_dir,
+                                                          env_form)
+        for bad_text in ("", "   ", "two words", "-leading", "../escape"):
+            new_dialog.name_edit.setText(bad_text)
+            result(new_dialog.ok_button.isEnabled() is False
+                   and new_dialog.message_label.text() != "",
+                   "the name {!r} is refused with a reason".format(
+                       bad_text))
+        new_dialog.name_edit.setText("t3_env")
+        result(new_dialog.ok_button.isEnabled()
+               and new_dialog.environment_name() == "t3_env",
+               "the valid name 't3_env' enables OK and round-trips")
+        result(installed_envs.validate_name("t3_env", envs_root_dir)
+               == "t3_env",
+               "validate_name accepts and returns the same name")
+
+        # Round 18, the delete picker's styled dialog (the plain
+        # QInputDialog.getItem it replaced never took the plugin's dark
+        # dialog stylesheet): constructed headless, never exec()'d -- the
+        # object name puts it under the #env_dialog rules, the list
+        # carries one row per environment, the first is pre-selected, OK
+        # follows the selection, and the picked name round-trips.
+        delete_dialog = installed_form.DeleteEnvironmentDialog(
+            ["t3_env", "t3_other"], env_form)
+        result(delete_dialog.objectName() == "env_dialog"
+               and delete_dialog.styleSheet()
+               == installed_form._DIALOG_STYLESHEET,
+               "the delete picker carries the plugin's dialog stylesheet "
+               "under the #env_dialog object name")
+        result("QDialog#env_dialog QListWidget#env_delete_list"
+               in installed_form._DIALOG_STYLESHEET,
+               "the stylesheet styles the delete picker's list")
+        result(delete_dialog.windowTitle() == "Dragonfly Notebook"
+               and delete_dialog.env_list.count() == 2
+               and delete_dialog.env_list.item(0).text() == "t3_env"
+               and delete_dialog.env_list.item(1).text() == "t3_other",
+               "the delete picker lists the environments under the "
+               "plugin's window title")
+        result(delete_dialog.env_list.currentRow() == 0
+               and delete_dialog.ok_button.isEnabled()
+               and delete_dialog.selected_environment() == "t3_env",
+               "the delete picker pre-selects the first environment and "
+               "round-trips it")
+        delete_dialog.env_list.setCurrentRow(1)
+        result(delete_dialog.selected_environment() == "t3_other"
+               and delete_dialog.ok_button.isEnabled(),
+               "picking the second environment moves the selection and "
+               "keeps OK enabled")
+        delete_dialog.env_list.setCurrentRow(-1)
+        result(delete_dialog.ok_button.isEnabled() is False
+               and delete_dialog.selected_environment() == "",
+               "no selection disables OK and yields no name")
+        delete_dialog.env_list.setCurrentRow(0)
+
+        # The pip command normalizer (the round-17 button's validation
+        # front AND the argv builder's shared tail).
+        result(installed_envs.pip_command_words(
+                   'pip install "scipy>=1.10"  numpy') ==
+               ["install", "scipy>=1.10", "numpy"],
+               "pip_command_words strips the launcher and splits on "
+               "whitespace and quotes")
+        result(installed_envs.pip_command_words("pip update pandas") ==
+               ["install", "--upgrade", "pandas"],
+               "pip_command_words runs update as install --upgrade")
+        result(installed_envs.pip_command_words("pip uninstall numpy") ==
+               ["uninstall", "numpy", "-y"],
+               "pip_command_words auto-confirms an uninstall")
+        try:
+            installed_envs.pip_command_words("pip")
+            refused = False
+        except ValueError:
+            refused = True
+        result(refused,
+               "pip_command_words refuses a bare launcher (nothing to "
+               "run)")
+
+        # The REAL venv creation, streamed through the same builder the
+        # '+ New Environment' flow uses (``_creation_run_dialog``: the
+        # title, the phase notes, the venv argv, the exit-code note;
+        # driven directly with start + pump, never the modal exec). This
+        # is the real `python -m venv` on the embedded interpreter
+        # through the no-window bootstrap (~40 s measured in the round-16
+        # probes).
+        venv_dir = installed_envs.env_dir(envs_root_dir, "t3_env")
+        create_dialog = env_form._creation_run_dialog("t3_env", venv_dir)
+        _wait_env_dialog(create_dialog, "the venv creation", 180.0)
+        # The phase notes ARE the transcript (``python -m venv`` is
+        # silent, so round 16 added exactly this visibility): the two
+        # intro notes open the run and the exit-code
+        # note ends it. The venv's files are the real success proof,
+        # pinned next.
+        create_transcript = create_dialog.transcript
+        result(create_dialog.exit_code == 0
+               and create_transcript[0] == "Creating the virtual "
+               "environment 't3_env' (python -m venv)."
+               and "prints nothing on its own" in create_transcript[1]
+               and create_transcript[-1] == "The environment was created "
+               "(exit code 0).",
+               "the creation streamed its phases ({} lines: {!r})"
+               .format(len(create_transcript), create_transcript))
+        result(os.path.isfile(os.path.join(venv_dir, "pyvenv.cfg"))
+               and os.path.isfile(installed_envs.venv_python(venv_dir)),
+               "the venv carries pyvenv.cfg and its own python.exe")
+        result(installed_envs.list_environments(envs_root_dir)
+               == ["t3_env"],
+               "discovery offers exactly the created environment")
+        result(create_dialog.cancel_button.isHidden()
+               and not create_dialog.close_button.isHidden(),
+               "the run's end flipped the dialog's Cancel to Close")
+
+        # The hand-built wheel (the round-16 probe recipe: a pure-python
+        # zip wheel with RECORD hashes) installs OFFLINE through the
+        # venv's OWN pip; the builder is shared by the base-install pin
+        # here and the pip-button pin below (two different packages, so
+        # each install is its own event).
+        def _build_t3_wheel(path, package, which):
+            src = "WHERE = __file__\nWHICH = {!r}\n".format(which).encode()
+            dist_info = package + "-1.0.dist-info"
+            record_entries = []
+
+            def _record(name, data):
+                digest = base64.urlsafe_b64encode(
+                    hashlib.sha256(data).digest()).rstrip(b"=").decode()
+                record_entries.append(
+                    "{},sha256={},{}".format(name, digest, len(data)))
+
+            with zipfile.ZipFile(path, "w") as zf:
+                zf.writestr(package + "/__init__.py", src)
+                _record(package + "/__init__.py", src)
+                meta = ("Metadata-Version: 2.1\nName: {}\n"
+                        "Version: 1.0\n".format(
+                            package.replace("_", "-"))).encode()
+                zf.writestr(dist_info + "/METADATA", meta)
+                _record(dist_info + "/METADATA", meta)
+                wheel_txt = ("Wheel-Version: 1.0\nGenerator: dfnb-tier3\n"
+                             "Root-Is-Purelib: true\n"
+                             "Tag: py3-none-any\n").encode()
+                zf.writestr(dist_info + "/WHEEL", wheel_txt)
+                _record(dist_info + "/WHEEL", wheel_txt)
+                record = ("\n".join(record_entries) + "\n"
+                          + dist_info + "/RECORD,,\n").encode()
+                zf.writestr(dist_info + "/RECORD", record)
+            return path
+
+        # Round 17's second creation dialog: the base-package install
+        # (numpy and pandas in the real flow), streamed the same way --
+        # driven offline with a wheel in place of the contract so the
+        # phase notes pin without the network. The real flow runs this
+        # between the creation and the refresh, so the order here is
+        # the order the GUI runs.
+        base_wheel = _build_t3_wheel(
+            os.path.join(temp_dir, "dfnb_t3_base-1.0-py3-none-any.whl"),
+            "dfnb_t3_base", "t3-base-wheel")
+        base_dialog = env_form._base_install_run_dialog(
+            "t3_env", venv_dir, ["--no-index", base_wheel])
+        _wait_env_dialog(base_dialog, "the base-package install", 180.0)
+        result(base_dialog.exit_code == 0
+               and base_dialog.transcript[0] ==
+               "Installing the base packages the notebook needs "
+               "(--no-index, {}): numpy arrays carry the volumes, "
+               "pandas DataFrames carry the measured properties."
+               .format(base_wheel)
+               and "PyPI" in base_dialog.transcript[1]
+               and base_dialog.transcript[-1] ==
+               "The base packages were installed (exit code 0).",
+               "the base install streamed its phases ({} lines, tail "
+               "{!r})".format(len(base_dialog.transcript),
+                              base_dialog.transcript[-3:]))
+        result(os.path.isfile(os.path.join(
+                   installed_envs.venv_site_packages(venv_dir),
+                   "dfnb_t3_base", "__init__.py")),
+               "the base wheel's package landed in the venv's "
+               "site-packages")
+
+        # The form's discovery picks the new environment up, and the USER
+        # pick (a real setCurrentIndex, the signal path) switches the
+        # notebook to it: the metadata, the combo, the status label and
+        # the pip rule all follow (the kernel is not started by the pick
+        # -- the first cell run starts it, as a subprocess on the venv's
+        # own interpreter).
+        env_form._refresh_env_list()
+        refreshed_items = [env_combo.itemText(i)
+                           for i in range(env_combo.count())]
+        result(env_combo.count() == 5
+               and refreshed_items == [installed_envs.EMBEDDED_LABEL,
+                                       "t3_env", "",
+                                       installed_envs.NEW_ENV_LABEL,
+                                       installed_envs.DELETE_ENV_LABEL],
+               "the refreshed combo lists the embedded entry, the "
+               "environment, a separator and the two administrative "
+               "entries: {}".format(refreshed_items))
+        env_index = env_combo.findData("t3_env")
+        result(env_index == 1, "the environment sits at index 1")
+        env_combo.setCurrentIndex(env_index)
+        result(env_form._selected_environment == "t3_env"
+               and env_form.document.metadata["dfnb_environment"]
+               == "t3_env",
+               "the pick switched the selection and the notebook's "
+               "metadata")
+        result(env_form._env_label.text() == "env: t3_env",
+               "the status strip names the selected environment")
+        result(env_form._pip_button.isEnabled()
+               and "run a pip command in the environment 't3_env'"
+               in env_form._pip_button.toolTip(),
+               "the pip button enabled on the custom, idle environment "
+               "with its tooltip: {!r}".format(
+                   env_form._pip_button.toolTip()))
+
+        # The pip-button pin's wheel: the shared builder's second
+        # product (the exact command the pip button runs, driven
+        # through the same streaming dialog).
+        wheel_path = _build_t3_wheel(
+            os.path.join(temp_dir, "dfnb_t3_pkg-1.0-py3-none-any.whl"),
+            "dfnb_t3_pkg", "t3-wheel")
+
+        # The pip run through the same builder the button uses
+        # (``_pip_run_dialog``), driven with the FULL command text the
+        # round-17 button takes: the intro note naming the command as
+        # typed opens the transcript, pip's own lines follow, the
+        # exit-code note ends it.
+        the_command = "pip install --no-index " + wheel_path
+        pip_dialog = env_form._pip_run_dialog(
+            "t3_env", venv_dir, the_command)
+        _wait_env_dialog(pip_dialog, "the offline pip install", 180.0)
+        result(pip_dialog.exit_code == 0
+               and pip_dialog.transcript[0] ==
+               "Running the environment's own pip: {}.".format(
+                   the_command)
+               and pip_dialog.transcript[-1] ==
+               "The pip command finished (exit code 0).",
+               "the offline install streamed its phases ({} lines, tail "
+               "{!r})".format(len(pip_dialog.transcript),
+                              pip_dialog.transcript[-3:]))
+        result(os.path.isfile(
+                   os.path.join(
+                       installed_envs.venv_site_packages(venv_dir),
+                       "dfnb_t3_pkg", "__init__.py")),
+               "the wheel's package landed in the venv's site-packages")
+
+        # The crown pin: a real cell runs through the form's kernel ON the
+        # environment (round 16's subprocess model: the GUI and this form
+        # stay on the embedded Python; the kernel spawns the environment
+        # runner as a subprocess on the VENV's own python.exe, and the
+        # cell executes there, importing the pip-installed package from
+        # the venv's site-packages) -- and the started kernel holds the
+        # in-use lock, so the pip button disables.
+
+        def _wait_env_run(timeout_s=180.0):
+            deadline = time.monotonic() + timeout_s
+            while env_form._running:
+                if time.monotonic() > deadline:
+                    result(False, "the environment cell did not finish "
+                                  "within {} s".format(timeout_s))
+                app.processEvents()
+                time.sleep(0.02)
+            for _ in range(5):
+                app.processEvents()
+                time.sleep(0.02)
+
+        env_form._cell_widgets[0]["editor"].setPlainText(
+            'import dfnb_t3_pkg\n'
+            'print("T3ENV", dfnb_t3_pkg.WHICH, dfnb_t3_pkg.WHERE)')
+        result(env_form._run_cell_at(0) is True,
+               "the environment cell started")
+        _wait_env_run()
+        env_outputs = env_form.document.get_cell(0)["outputs"]
+        env_stream = "".join(
+            output.get("text", "") for output in env_outputs
+            if output.get("output_type") == "stream")
+        result(env_stream.startswith("T3ENV t3-wheel ")
+               and venv_dir in env_stream,
+               "the cell imported the wheel's package from the venv "
+               "(stream {!r})".format(env_stream))
+        result(not [output for output in env_outputs
+                    if output.get("output_type") == "error"],
+               "the environment cell ran without errors")
+        result(env_form.kernel.is_started
+               and env_form.kernel.active_environment == venv_dir
+               and installed_envs.is_environment_in_use(venv_dir) is True,
+               "the started kernel runs on the environment and holds its "
+               "in-use lock")
+        # Round 18: the running kernel no longer DISABLES the pip
+        # button (a cell run leaves the kernel started, so the old rule
+        # locked the button forever after the first cell) -- the hold
+        # surfaces as the tooltip's file-in-use risk note instead.
+        result(env_form._pip_button.isEnabled()
+               and "file-in-use" in env_form._pip_button.toolTip(),
+               "the pip button STAYS ENABLED while the kernel runs on "
+               "the environment, the risk in its tooltip: {!r}".format(
+                   env_form._pip_button.toolTip()))
+        result(env_combo.isEnabled(),
+               "the combo stays enabled while only the kernel runs")
+
+        # Round 18, the restart pin: a RESTARTED kernel is still a
+        # running kernel (the in-use lock stays held by design, the
+        # namespace wipe is in place), and the controls re-render at
+        # restart_finished -- the button must be ENABLED there too.
+        restart_results = []
+        env_form.kernel.restart_finished.connect(
+            lambda ok, message: restart_results.append((ok, message)))
+        env_form.kernel.restart()
+        restart_deadline = time.monotonic() + 60.0
+        while not restart_results:
+            if time.monotonic() > restart_deadline:
+                result(False, "the kernel restart never finished within "
+                              "60 s")
+                break
+            app.processEvents()
+            time.sleep(0.02)
+        result(bool(restart_results) and restart_results[0][0] is True,
+               "the kernel restart completed (result {!r})"
+               .format(restart_results))
+        result(env_form.kernel.is_started
+               and env_form.kernel.active_environment == venv_dir
+               and installed_envs.is_environment_in_use(venv_dir) is True,
+               "the restarted kernel still runs on the environment and "
+               "holds its in-use lock")
+        result(env_form._pip_button.isEnabled()
+               and "file-in-use" in env_form._pip_button.toolTip(),
+               "the pip button is enabled AFTER the restart finished "
+               "with the risk note re-rendered: {!r}".format(
+                   env_form._pip_button.toolTip()))
+
+        # The dfnb relay across the environment boundary (round 16's
+        # subprocess model): the cell's dfnb call executes in the venv's
+        # child process, crosses to this app process as a runner request
+        # line, rides the kernel's relay thread into the REAL bridge
+        # service behind this form, and the answer returns as the cell's
+        # stream output. ORS never imports in the child; the answer here
+        # is the client's unwrapped list of live-object dicts (the
+        # handler's {'objects': [...]} payload is the wire shape, the
+        # client method returns the list itself -- possibly empty, the
+        # shape is the pin, not the contents).
+        env_form._cell_widgets[0]["editor"].setPlainText(
+            'objects = dfnb.list_objects()\n'
+            'print("T3RELAY", isinstance(objects, list),\n'
+            '      all(isinstance(item, dict) and\n'
+            '          {"guid", "title", "class_name"} <= set(item)\n'
+            '          for item in objects))')
+        result(env_form._run_cell_at(0) is True,
+               "the relay cell started")
+        _wait_env_run()
+        relay_outputs = env_form.document.get_cell(0)["outputs"]
+        relay_stream = "".join(
+            output.get("text", "") for output in relay_outputs
+            if output.get("output_type") == "stream")
+        result("T3RELAY True True" in relay_stream
+               and not [output for output in relay_outputs
+                        if output.get("output_type") == "error"],
+               "the environment cell's dfnb call crossed child -> relay "
+               "-> bridge and back (stream {!r})".format(relay_stream))
+
+        # Round 17, the shell escape through the REAL environment child:
+        # the '!python' reroute lands on the venv's own interpreter (the
+        # child's sys.executable), the no-window grandchild writes into
+        # the captured pipe, and the forwarder streams it back as the
+        # cell's output -- the same captured-pipe path every
+        # '!command' cell takes (pip cells are refused, round 17: pip
+        # runs from the button).
+        env_form._cell_widgets[0]["editor"].setPlainText(
+            '!python -c "import sys; print(sys.executable)"')
+        result(env_form._run_cell_at(0) is True,
+               "the shell-escape cell started")
+        _wait_env_run()
+        bang_outputs = env_form.document.get_cell(0)["outputs"]
+        bang_stream = "".join(
+            output.get("text", "") for output in bang_outputs
+            if output.get("output_type") == "stream")
+        bang_line = bang_stream.strip()
+        result(not [output for output in bang_outputs
+                    if output.get("output_type") == "error"]
+               and bang_line
+               and os.path.normcase(bang_line) == os.path.normcase(
+                   installed_envs.venv_python(venv_dir)),
+               "the '!python -c' cell streamed the venv's own "
+               "interpreter path through the environment child (stream "
+               "{!r})".format(bang_stream))
+
+        # Round 17, the runtime DLL delivery on a real venv child: the
+        # kernel's start copied the SCAN-DISCOVERED misparked set into
+        # the venv's Scripts (ensure_runtime_dlls -- not name-keyed,
+        # round 17's follow-up: the import tables of the base tree's
+        # extension modules decide, and on this machine that set heals
+        # sqlite3 AND tkinter alike) and the runner armed that
+        # directory for the dependent load (the two-piece fix: a
+        # base-tree pyd's altered search never reaches the exe dir on
+        # its own, probe-proven), so the stdlib extension family
+        # imports inside the environment kernel -- in a bare venv on
+        # this distribution sqlite3 and tkinter are DLL-load
+        # ImportErrors.
+        runtime_code = (
+            'import bz2, ctypes, hashlib, lzma, select\n'
+            'import sqlite3, ssl, unicodedata, zlib\n'
+            'print("T3RT", sqlite3.connect(":memory:")\n'
+            '      .execute("select 41 + 1").fetchone()[0],\n'
+            '      ssl.OPENSSL_VERSION.split()[1],\n'
+            '      ctypes.sizeof(ctypes.c_void_p))')
+        if os.path.isfile(os.path.join(
+                os.path.dirname(installed_envs.venv_python(venv_dir)),
+                'tcl86t.dll')):
+            runtime_code += ('\nimport tkinter\n'
+                             'print("T3TK", tkinter.TkVersion)')
+        env_form._cell_widgets[0]["editor"].setPlainText(runtime_code)
+        result(env_form._run_cell_at(0) is True,
+               "the runtime-DLL cell started")
+        _wait_env_run()
+        rt_outputs = env_form.document.get_cell(0)["outputs"]
+        rt_stream = "".join(
+            output.get("text", "") for output in rt_outputs
+            if output.get("output_type") == "stream")
+        result("T3RT 42" in rt_stream
+               and ("T3TK" not in runtime_code
+                    or "T3TK 8" in rt_stream)
+               and not [output for output in rt_outputs
+                        if output.get("output_type") == "error"],
+               "the environment child imported the stdlib extension "
+               "family and answered a sqlite query (stream "
+               "{!r})".format(rt_stream))
+
+        # Round 17's pip rule, pinned where the user meets it: pip does
+        # NOT run from cells. A '%pip3 list' cell fails the runner's
+        # parse with the explained magic error (every % magic is
+        # unsupported in an environment kernel, pip included), and an
+        # '!pip3 list' cell completes cleanly whose ONLY output is the
+        # note naming the pip button -- no package table ever streams,
+        # because nothing spawned.
+        env_form._cell_widgets[0]["editor"].setPlainText('%pip3 list')
+        result(env_form._run_cell_at(0) is True,
+               "the %pip3 cell started")
+        _wait_env_run()
+        magic_outputs = env_form.document.get_cell(0)["outputs"]
+        magic_errors = [
+            output for output in magic_outputs
+            if output.get("output_type") == "error"]
+        result(len(magic_errors) == 1
+               and "pip button" in magic_errors[0].get("evalue", "")
+               and "magics" in magic_errors[0].get("evalue", ""),
+               "the '%pip3 list' cell ended in the explained magic "
+               "error pointing at the pip button (errors {!r})"
+               .format(magic_errors))
+
+        env_form._cell_widgets[0]["editor"].setPlainText('!pip3 list')
+        result(env_form._run_cell_at(0) is True,
+               "the !pip3 cell started")
+        _wait_env_run()
+        pip3_outputs = env_form.document.get_cell(0)["outputs"]
+        pip3_stream = "".join(
+            output.get("text", "") for output in pip3_outputs
+            if output.get("output_type") == "stream")
+        result("pip button" in pip3_stream
+               and "dfnb-t3-base" not in pip3_stream
+               and not [output for output in pip3_outputs
+                        if output.get("output_type") == "error"],
+               "the '!pip3 list' cell wrote the button note and spawned "
+               "nothing (no package table: stream {!r})"
+               .format(pip3_stream))
+
+        # The switch back to the embedded Python while the kernel runs on
+        # the environment: the confirm auto-accepts under the suite seam
+        # (a LOG record), the kernel shuts down (tearing the venv child
+        # down with it; the in-use lock frees), the metadata drops the
+        # key, and the pip button falls back to its embedded reason.
+        switch_log = _RecordingLogHandler()
+        form_logger.addHandler(switch_log)
+        try:
+            env_combo.setCurrentIndex(0)
+        finally:
+            form_logger.removeHandler(switch_log)
+        result(len(switch_log.records) == 1
+               and "auto-accepted under test" in switch_log.records[0],
+               "the switch confirm auto-accepted under test with one log "
+               "record ({} entries)".format(len(switch_log.records)))
+        deadline = time.monotonic() + 60.0
+        while env_form.kernel.is_started:
+            if time.monotonic() > deadline:
+                result(False, "the kernel never shut down for the switch")
+            app.processEvents()
+            time.sleep(0.02)
+        # The teardown frees the in-use lock AFTER its bounded child-exit
+        # wait, which trails the is_started flip (the flag drops at the
+        # teardown's first line): wait for the lock with its own bound
+        # instead of sampling it once. A sample right after the flip
+        # races the teardown's tail -- the round-16 one-time staged
+        # flake of this pin was exactly that window, and round 17's
+        # polling watcher (a 50 ms quit latency) made it wide enough
+        # to catch again.
+        lock_deadline = time.monotonic() + 10.0
+        while installed_envs.is_environment_in_use(venv_dir):
+            if time.monotonic() > lock_deadline:
+                break
+            app.processEvents()
+            time.sleep(0.02)
+        result(env_form.kernel.is_started is False
+               and installed_envs.is_environment_in_use(venv_dir)
+               is False,
+               "the switch shut the kernel down and freed the lock")
+        result(env_form._selected_environment is None
+               and "dfnb_environment" not in env_form.document.metadata,
+               "the switch back to embedded dropped the metadata key")
+        result(env_form._pip_button.isEnabled() is False
+               and "not pip-installable" in env_form._pip_button.toolTip(),
+               "the pip button disabled again on the embedded Python")
+
+        # The notebook remembers its environment: selecting it again and
+        # saving round-trips the metadata, and the form's real open tail
+        # (_load_notebook_document) restores the selection.
+        env_combo.setCurrentIndex(env_combo.findData("t3_env"))
+        result(env_form._selected_environment == "t3_env",
+               "re-selecting the environment switched back to it")
+        env_notebook_path = os.path.join(temp_dir, "env_roundtrip.ipynb")
+        env_form.file_path = env_notebook_path
+        result(env_form.on_save_notebook() is True
+               and os.path.isfile(env_notebook_path),
+               "the environment notebook saved")
+        reloaded_env = installed_core.NotebookDocument.from_file(
+            env_notebook_path)
+        result(reloaded_env.metadata.get("dfnb_environment") == "t3_env",
+               "the saved notebook carries dfnb_environment='t3_env'")
+        env_form._load_notebook_document(
+            installed_core.NotebookDocument.from_file(env_notebook_path),
+            env_notebook_path)
+        result(env_form._selected_environment == "t3_env"
+               and env_form.document.metadata.get("dfnb_environment")
+               == "t3_env"
+               and env_combo.currentData() == "t3_env",
+               "the open path restored the saved environment")
+
+        # A saved name that no longer exists falls back to the embedded
+        # Python (one LOG record and a status note; the notebook still
+        # opens).
+        ghost_doc = installed_core.NotebookDocument.from_file(
+            env_notebook_path)
+        ghost_doc.metadata["dfnb_environment"] = "ghost_env"
+        ghost_notebook_path = os.path.join(temp_dir, "env_ghost.ipynb")
+        ghost_doc.save(ghost_notebook_path)
+        ghost_log = _RecordingLogHandler()
+        form_logger.addHandler(ghost_log)
+        try:
+            env_form._load_notebook_document(
+                installed_core.NotebookDocument.from_file(
+                    ghost_notebook_path),
+                ghost_notebook_path)
+        finally:
+            form_logger.removeHandler(ghost_log)
+        result(env_form._selected_environment is None
+               and env_combo.currentData() is None,
+               "the missing environment fell back to the embedded Python")
+        result(len(ghost_log.records) == 1
+               and "no longer exists" in ghost_log.records[0],
+               "the fallback logged exactly one record ({} entries)"
+               .format(len(ghost_log.records)))
+        result("no longer exists" in env_form.status_label.text(),
+               "the status names the fallback: {!r}".format(
+                   env_form.status_label.text()))
+
+        # The streaming dialog's close refusal while a child runs (Esc or
+        # the window's X must not orphan the reader thread), observed
+        # through the finished signal with the dialog never shown: a
+        # 3-second child, reject() refused mid-run, reject() accepted
+        # after the end.
+        sleep_dialog = installed_form._EnvProcessDialog(
+            "t3 refusal pin", env_form)
+        finished_box = {}
+        sleep_dialog.finished.connect(
+            lambda *_: finished_box.update(finished=True))
+        sleep_dialog.start([sys.executable, "-c",
+                            "import time; time.sleep(3)"])
+        sleep_dialog.reject()
+        result("finished" not in finished_box,
+               "reject() is refused while the child runs (finished never "
+               "emitted)")
+        _wait_env_dialog(sleep_dialog, "the sleep child", 30.0)
+        result(sleep_dialog.exit_code == 0,
+               "the sleep child finished cleanly")
+        sleep_dialog.reject()
+        result(finished_box.get("finished") is True,
+               "reject() closes the dialog once the run ended")
+
+        # The pip failure path: an unresolvable specifier offline fails
+        # with pip's own diagnostic in the transcript (the exit code is
+        # what the form's failure box quotes).
+        fail_dialog = installed_form._EnvProcessDialog(
+            "t3 pip failure pin", env_form)
+        fail_dialog.start(installed_envs.pip_install_command(
+            venv_dir, ["--no-index", "dfnb-nope-pkg"]))
+        _wait_env_dialog(fail_dialog, "the failing pip install", 120.0)
+        result(fail_dialog.exit_code != 0
+               and any("No matching distribution" in line
+                       for line in fail_dialog.transcript),
+               "the failing install surfaced pip's diagnostic (exit {})"
+               .format(fail_dialog.exit_code))
+
+        # Round 17, the delete flow on the real t3_env: re-select it
+        # first (so the deletion also exercises the silent switch back
+        # to the embedded Python). Round 18 reshapes the flow's teeth:
+        # the refusal remains only for a hold this window cannot stop
+        # (pinned on the SECOND venv, the direct lock standing in for
+        # another notebook window's OS hold), and the delete with THIS
+        # window's kernel running on t3_env -- the case the old refusal
+        # made impossible after running any cell -- must stop the
+        # kernel, free the lock, remove the tree and switch back.
+        env_combo.setCurrentIndex(env_combo.findData("t3_env"))
+        result(env_form._selected_environment == "t3_env",
+               "re-selecting the environment switched back to it for "
+               "the delete pins")
+
+        # Round 17 review coverage, the UNSELECTED branch of the delete:
+        # a second real venv exists while t3_env stays selected, and
+        # deleting the OTHER environment must not touch the notebook's
+        # selection or metadata (the silent switch back belongs to the
+        # selected-env branch alone).
+        other_venv = installed_envs.env_dir(envs_root_dir, "t3_other")
+        other_creation = subprocess.run(
+            installed_envs.venv_creation_command(other_venv),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            timeout=300,
+            creationflags=installed_envs.CREATE_NO_WINDOW)
+        result(other_creation.returncode == 0
+               and os.path.isfile(installed_envs.venv_python(other_venv)),
+               "the second real venv was created for the unselected "
+               "delete (exit {})".format(other_creation.returncode))
+        env_form._refresh_env_list()
+        result(env_combo.findData("t3_other") != -1,
+               "the refreshed combo lists the second environment")
+
+        # Round 18, the refusal's narrowed subject: a hold this window
+        # cannot stop (the direct lock on t3_other, standing in for
+        # another notebook window's kernel) refuses the delete; the
+        # kernel of THIS window is NOT the holder here, so the new
+        # stop-first seam must not fire and the selection must stay.
+        marker = installed_envs.acquire_in_use(other_venv)
+        result(os.path.isfile(marker),
+               "the in-use marker sits inside the environment")
+        env_form._delete_environment("t3_other")
+        result(os.path.isdir(other_venv)
+               and env_form._selected_environment == "t3_env"
+               and "in use" in env_form.status_label.text(),
+               "the in-use delete refused and said whose hold it is "
+               "(status {!r})".format(env_form.status_label.text()))
+        result(installed_envs.release_in_use(other_venv) is True,
+               "the suite released its hold on the environment")
+        env_form._delete_environment("t3_other")
+        result(not os.path.isdir(other_venv)
+               and env_form._selected_environment == "t3_env"
+               and env_combo.findData("t3_env") != -1
+               and env_combo.currentData() == "t3_env"
+               and "was deleted" in env_form.status_label.text(),
+               "deleting an UNSELECTED environment removed its tree and "
+               "left the notebook on t3_env (status {!r})".format(
+                   env_form.status_label.text()))
+
+        # Round 18, the delete with THIS window's kernel running on the
+        # environment: a cell lazy-starts the kernel on t3_env (the
+        # common state after running cells, the old permanent refusal's
+        # victim), then the delete stops the kernel first (the queued
+        # shutdown tears the venv child down and frees the in-use
+        # lock), removes the tree, and silently switches the notebook
+        # back to the embedded Python.
+        env_form._cell_widgets[0]["editor"].setPlainText(
+            'print("T3DELRUN")')
+        result(env_form._run_cell_at(0) is True,
+               "the pre-delete cell started")
+        _wait_env_run()
+        result(env_form.kernel.is_started
+               and env_form.kernel.active_environment == venv_dir
+               and installed_envs.is_environment_in_use(venv_dir) is True,
+               "the kernel runs on the environment marked for deletion")
+        env_form._delete_environment("t3_env")
+        result(not os.path.isdir(venv_dir),
+               "the delete removed the environment's tree from disk "
+               "while this window's kernel ran on it")
+        result(env_form.kernel.is_started is False
+               and installed_envs.is_environment_in_use(venv_dir) is False,
+               "the delete stopped this window's kernel and freed the "
+               "in-use lock")
+        result(env_form._selected_environment is None
+               and "dfnb_environment" not in env_form.document.metadata
+               and env_combo.currentData() is None
+               and installed_envs.list_environments(envs_root_dir) == [],
+               "deleting the selected environment silently switched the "
+               "notebook back to the embedded Python")
+        result("was deleted" in env_form.status_label.text(),
+               "the status confirms the deletion: {!r}".format(
+                   env_form.status_label.text()))
+        after_delete_items = [env_combo.itemText(i)
+                              for i in range(env_combo.count())]
+        result(after_delete_items == [installed_envs.EMBEDDED_LABEL,
+                                      installed_envs.NEW_ENV_LABEL,
+                                      installed_envs.DELETE_ENV_LABEL],
+               "the refreshed combo carries the embedded entry and the "
+               "two administrative entries only: {}".format(
+                   after_delete_items))
+
+        # Round 18 review, the spawn-failure path end to end: the venv's
+        # interpreter gone between the selection and the click (an env
+        # dir that carries pyvenv.cfg but no python.exe -- discovery
+        # would never offer it, so the selection is set directly, the
+        # stale state a hand-deleted interpreter leaves behind). The
+        # run helper (_env_run_dialog) catches the popen's OSError and
+        # returns None, so the pip button's ``dialog is None`` branch
+        # owns the report: no exception escapes the Qt slot, the status
+        # line names the failure, exactly ONE box fires (the log record
+        # under the test seam, the open-failure one-box pattern), and
+        # the pip button comes back enabled with the install-running
+        # flag dropped. The spec dialog is stubbed the way the
+        # save-failure pin stubs document.save: swap and restore.
+        ghost_dir = installed_envs.env_dir(envs_root_dir, "t3_ghost")
+        os.makedirs(ghost_dir, exist_ok=True)
+        with open(os.path.join(ghost_dir, "pyvenv.cfg"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("home = {}\n".format(
+                os.path.dirname(sys.executable)))
+        result(os.path.isfile(installed_envs.venv_python(ghost_dir))
+               is False,
+               "the ghost environment carries no interpreter to spawn")
+        env_form._selected_environment = "t3_ghost"
+        real_pip_command_text = installed_form.pip_command_text
+        installed_form.pip_command_text = (
+            lambda environment_name, parent=None: "pip list")
+        spawn_log = _RecordingLogHandler()
+        form_logger.addHandler(spawn_log)
+        slot_raised = None
+        try:
+            records_before = len(spawn_log.records)
+            try:
+                env_form._on_pip_button()
+            except Exception as exc:
+                slot_raised = exc
+        finally:
+            installed_form.pip_command_text = real_pip_command_text
+            form_logger.removeHandler(spawn_log)
+        spawn_entries = spawn_log.records[records_before:]
+        result(slot_raised is None,
+               "the spawn failure did not escape the Qt slot ({!r})"
+               .format(slot_raised))
+        result("did not start" in env_form.status_label.text()
+               and "t3_ghost" in env_form.status_label.text(),
+               "the status line reports the pip spawn failure: {!r}"
+               .format(env_form.status_label.text()))
+        result(len(spawn_entries) == 1
+               and spawn_entries[0].startswith("Dragonfly Notebook:")
+               and "t3_ghost" in spawn_entries[0]
+               and "did not start" in spawn_entries[0]
+               and "WinError 2" in spawn_entries[0],
+               "exactly ONE failure box fired (one 'Dragonfly Notebook' "
+               "log entry) naming the environment and the OSError "
+               "(Popen's WinError 2, the message carries no filename "
+               "on Windows): {!r}".format(spawn_entries))
+        result(env_form._env_install_running is False,
+               "the spawn failure dropped the install-running flag")
+        result(env_form._pip_button.isEnabled()
+               and "run a pip command in the environment 't3_ghost'"
+               in env_form._pip_button.toolTip(),
+               "the pip button is enabled again after the spawn failure "
+               "with its idle tooltip: {!r}".format(
+                   env_form._pip_button.toolTip()))
+        # leave the form as the section found it (the ghost tree goes
+        # with the suite's temp-root teardown below)
+        env_form._selected_environment = None
+        env_form._update_env_controls()
+    finally:
+        if env_form is not None:
+            try:
+                env_form.kernel.stop()
+            except Exception:
+                pass
+            try:
+                env_form.client.close()
+            except Exception:
+                pass
+        try:
+            env_service.close()
+        except Exception:
+            pass
+        # the temp environments root leaves with the suite (best-effort;
+        # every child was pumped to completion above)
+        shutil.rmtree(envs_root_dir, ignore_errors=True)
 
 finally:
     deleted = 0

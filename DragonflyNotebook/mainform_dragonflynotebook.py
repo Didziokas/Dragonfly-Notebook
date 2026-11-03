@@ -64,6 +64,27 @@ time, never at construction. Structural edits (add/delete/move/open/new)
 rebuild the cell widgets from the document after syncing editor texts
 back; a cell run never rebuilds.
 
+Custom Python environments (round 16): the main toolbar row carries an
+environment combo (Dragonfly's embedded Python first, then every venv
+under ``%LOCALAPPDATA%\\DragonflyNotebook\\environments``, then
+``+ New Environment``) and a pip button (round 17: one field taking the
+FULL pip command, e.g. ``pip install yfinance`` or ``pip uninstall
+numpy``; pip does not run from cells). The button is enabled while a
+custom environment is selected and nothing of this window is running (a
+cell run or an environment operation) -- round 18 dropped the
+in-use-kernel condition that locked it permanently after the first cell
+run (the kernel stays started, and a restart keeps its lock by
+design); a running kernel's hold is a tooltip note instead (replacing
+loaded DLLs can fail with a Windows file-in-use error). Deleting an
+environment (round 18) stops THIS window's kernel first when it runs
+on the deleted one; only another window's kernel still refuses.
+Switching
+environments while a kernel runs asks once, then shuts the kernel down:
+the next run lazy-starts on the new environment, whose packages overlay
+the embedded ones (see ``notebook_envs``). The choice is stored in the
+notebook's metadata (``dfnb_environment``) and restored on open; a
+missing environment falls back to the embedded Python.
+
 Named mainform_dragonflynotebook (the shipped mainform_* form-module
 pattern the plugin used): on Windows's case-insensitive filesystem a
 form module named 'dragonflynotebook.py' would collide with the plugin
@@ -77,20 +98,23 @@ os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'True')
 
 import logging  # noqa: E402
 import math  # noqa: E402
+import shutil  # noqa: E402
+import threading  # noqa: E402
 import time  # noqa: E402
 
-from PyQt6.QtCore import QLocale, Qt, QTimer, pyqtSignal  # noqa: E402
+from PyQt6.QtCore import QEventLoop, QLocale, Qt, QTimer, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QKeySequence, QShortcut, QTextCursor, QValidator  # noqa: E402
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,  # noqa: E402
                              QDialogButtonBox, QDoubleSpinBox, QFileDialog,
-                             QFormLayout, QFrame, QHBoxLayout, QLabel,
-                             QLineEdit, QListWidget, QListWidgetItem,
+                             QFormLayout, QFrame, QHBoxLayout,
+                             QLabel, QLineEdit, QListWidget, QListWidgetItem,
                              QMainWindow, QMenu, QMessageBox, QProgressBar,
                              QPushButton, QRadioButton, QScrollArea, QSpinBox,
                              QStackedWidget, QTextBrowser, QToolButton,
                              QVBoxLayout, QWidget)
 
 from .dfnb_client import DfnbClient  # noqa: E402
+from . import notebook_envs  # noqa: E402
 from .dragonflynotebook_core import (SNIPPET_ORDER, SNIPPET_SPECS,  # noqa: E402
                                      NotebookDocument, generate_snippet,
                                      registry_load, registry_save,
@@ -198,6 +222,22 @@ QWidget#toolbar QToolButton#run_all_button:hover {
     border: 1px solid #4F94CD; background: rgba(79, 148, 205, 0.12);
 }
 QWidget#toolbar QToolButton#run_all_button:disabled { color: #6A6A6A; }
+/* Round 16: the environment combo in the main toolbar row (the pip
+   button is a plain toolbar QToolButton, covered by the rules above).
+   The combo shares the toolbar's dark field look; its popup follows
+   the menu look. Scoped on QWidget#toolbar exactly like the tool
+   buttons, so no parented dialog's combos are touched. */
+QWidget#toolbar QComboBox {
+    background: #1E1E1E; color: #D4D4D4;
+    border: 1px solid #3C3C3C; border-radius: 4px; padding: 2px 6px;
+}
+QWidget#toolbar QComboBox:focus { border-color: #4F94CD; }
+QWidget#toolbar QComboBox:disabled { color: #6A6A6A; }
+QWidget#toolbar QComboBox::drop-down { border: none; }
+QWidget#toolbar QComboBox QAbstractItemView {
+    background: #252526; color: #D4D4D4; border: 1px solid #3C3C3C;
+    selection-background-color: #094771;
+}
 QToolButton#add_code_end_button, QToolButton#add_markdown_end_button {
     background: transparent; border: 1px solid transparent;
     border-radius: 4px; padding: 3px 8px; color: #9D9D9D;
@@ -279,6 +319,7 @@ QTextBrowser#cell_output {
     border-top: 1px solid #3C3C3C;
 }
 QLabel#status_label { color: #C8C8C8; }
+QLabel#env_label { color: #C8C8C8; }
 QFrame#status_strip { border-top: 1px solid #3C3C3C; background: #1E1E1E; }
 QLabel#watermark_label { color: #808080; font-size: 8pt; }
 
@@ -567,6 +608,99 @@ QDialog#snippet_dialog QDialogButtonBox QPushButton:default:hover,
 QMessageBox#dfnb_message QPushButton:default:hover {
     background: rgba(79, 148, 205, 0.24);
 }
+/* Round 16: the environment dialogs (the creation/pip streaming runner
+   and the two small input dialogs) -- the same palette as the pickers,
+   scoped to their own object name (#env_dialog, applied on the dialog
+   itself), plus the streaming runner's monospace output field and busy
+   bar (the status strip's busy-bar look) and a scrollbar block for the
+   output field (the round-9 ORS port, re-scoped). */
+QDialog#env_dialog { background: #252526; color: #D4D4D4; }
+QDialog#env_dialog QLabel { color: #D4D4D4; }
+QDialog#env_dialog QLineEdit {
+    background: #1E1E1E; color: #D4D4D4;
+    border: 1px solid #3C3C3C; border-radius: 3px; padding: 2px 6px;
+    selection-background-color: #094771;
+}
+QDialog#env_dialog QLineEdit:focus { border-color: #4F94CD; }
+QDialog#env_dialog QLineEdit:disabled { color: #6A6A6A; }
+QDialog#env_dialog QTextBrowser#env_output {
+    background: #1B1B1C; color: rgb(230, 230, 230);
+    border: 1px solid #3C3C3C; border-radius: 3px;
+}
+QDialog#env_dialog QProgressBar#env_progress {
+    background: #252526; border: 1px solid #3C3C3C; border-radius: 3px;
+    max-height: 10px; min-height: 10px;
+}
+QDialog#env_dialog QProgressBar#env_progress::chunk {
+    background: #4F94CD; border-radius: 3px;
+}
+QDialog#env_dialog QDialogButtonBox QPushButton {
+    background: #2D2D30; color: #D4D4D4;
+    border: 1px solid #3C3C3C; border-radius: 4px; padding: 4px 16px;
+}
+QDialog#env_dialog QDialogButtonBox QPushButton:hover {
+    background: #333337; border-color: #4A4A4A;
+}
+QDialog#env_dialog QDialogButtonBox QPushButton:pressed {
+    background: #333337;
+}
+QDialog#env_dialog QDialogButtonBox QPushButton:default {
+    color: #7FB3E0; background: rgba(79, 148, 205, 0.12);
+    border-color: #4F94CD;
+}
+QDialog#env_dialog QDialogButtonBox QPushButton:default:hover {
+    background: rgba(79, 148, 205, 0.24);
+}
+/* Round 18: the delete picker's environment list, the same field look
+   the snippet_dialog properties list uses (re-scoped to #env_dialog). */
+QDialog#env_dialog QListWidget#env_delete_list {
+    background: #1E1E1E; color: #D4D4D4;
+    border: 1px solid #3C3C3C; border-radius: 3px;
+}
+QDialog#env_dialog QListWidget#env_delete_list::item {
+    color: #D4D4D4; padding: 2px 4px;
+}
+QDialog#env_dialog QListWidget#env_delete_list::item:selected {
+    background: #094771;
+}
+QDialog#env_dialog QScrollBar:vertical {
+    background: QLinearGradient( x1: 0, y1: 0, x2: 1, y2: 0, stop: 0.0 #121212, stop: 0.2 #282828, stop: 1.0 #484848);
+    width: 9px;
+    margin: 16px 0 16px 0;
+    border: 1px solid #222222;
+}
+QDialog#env_dialog QScrollBar::handle:vertical {
+      background: QLinearGradient( x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #606060, stop: 0.5 #606060, stop: 1 #606060);
+      min-height: 20px;
+      border-radius: 2px;
+}
+QDialog#env_dialog QScrollBar::add-line:vertical {
+      border: 1px solid #1b1b19;
+      border-radius: 2px;
+      background: QLinearGradient( x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #404040, stop: 1 #404040);
+      height: 14px;
+      subcontrol-position: bottom;
+      subcontrol-origin: margin;
+}
+QDialog#env_dialog QScrollBar::sub-line:vertical {
+      border: 1px solid #1b1b19;
+      border-radius: 2px;
+      background: QLinearGradient( x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #404040, stop: 1 #404040);
+      height: 14px;
+      subcontrol-position: top;
+      subcontrol-origin: margin;
+}
+QDialog#env_dialog QScrollBar::up-arrow:vertical,
+QDialog#env_dialog QScrollBar::down-arrow:vertical {
+      border: 1px solid black;
+      width: 1px;
+      height: 1px;
+      background: white;
+}
+QDialog#env_dialog QScrollBar::add-page:vertical,
+QDialog#env_dialog QScrollBar::sub-page:vertical {
+      background: none;
+}
 """
 
 
@@ -767,7 +901,7 @@ class SnippetDialog(QDialog):
         self.kind = kind
         self._client = client
         spec = SNIPPET_SPECS[kind]
-        self.setWindowTitle('dfnb.{} — {}'.format(spec['function'],
+        self.setWindowTitle('dfnb.{} -- {}'.format(spec['function'],
                                                   spec['label']))
         # the dialog's own dark look (_DIALOG_STYLESHEET targets this
         # object name); applied HERE so no parent chain can leave the
@@ -1205,6 +1339,394 @@ def snippet_parameters_dialog(kind, client, parent=None):
 
 
 # ---------------------------------------------------------------------------
+# the environment dialogs (round 16)
+# ---------------------------------------------------------------------------
+
+class _EnvProcessDialog(QDialog):
+    """The streaming runner for the environment long runs (creating a
+    venv, pip installing into one): a monospace output browser that
+    grows line by line while the no-window child works (~40 s for a
+    venv, network time for a pip command), an indeterminate busy bar
+    (the status strip's busy-bar look), and a Cancel button that
+    terminates the child. Cancel flips to Close when the run ends.
+
+    Threading: :meth:`start` spawns the child (through
+    ``notebook_envs.popen``: CREATE_NO_WINDOW, merged pipes) on the
+    caller's thread; a daemon READER thread iterates the merged stdout
+    and forwards each line and the exit code through queued signals
+    (``line_arrived`` / ``run_done`` -- the reader never touches a
+    widget). Headless testing: the suite calls :meth:`start` and pumps
+    ``QApplication.processEvents`` until :attr:`exit_code` is set;
+    ``exec()`` is never called there (the SnippetDialog convention).
+    """
+
+    line_arrived = pyqtSignal(str)
+    run_done = pyqtSignal(int)
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.setObjectName('env_dialog')
+        self.setStyleSheet(_DIALOG_STYLESHEET)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        self._proc = None
+        self._reader = None
+        self._exit_code = None
+        self._cancelled = False
+        self._lines = []
+
+        self.output = QTextBrowser(self)
+        self.output.setObjectName('env_output')
+        self.output.setFont(code_font())
+        self.output.setFixedHeight(220)
+        self.progress = QProgressBar(self)
+        self.progress.setObjectName('env_progress')
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        self.progress.hide()  # shown when a run starts
+        self.buttons = QDialogButtonBox(self)
+        self.cancel_button = self.buttons.addButton(
+            'Cancel', QDialogButtonBox.ButtonRole.RejectRole)
+        self.close_button = self.buttons.addButton(
+            'Close', QDialogButtonBox.ButtonRole.AcceptRole)
+        self.close_button.hide()  # shown when the run ends
+        self.cancel_button.clicked.connect(self._on_cancel)
+        self.close_button.clicked.connect(self.accept)
+        self.line_arrived.connect(self._on_line_arrived)
+        self.run_done.connect(self._on_run_done)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.output)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.buttons)
+
+    # ---- the run -----------------------------------------------------------
+
+    def start(self, argv):
+        """Spawns the child and the reader thread. One dialog runs ONE
+        child (the form creates a fresh dialog per operation)."""
+        self._proc = notebook_envs.popen(argv)
+        self.progress.show()
+        self._reader = threading.Thread(target=self._read_child, daemon=True)
+        self._reader.start()
+
+    def _read_child(self):
+        proc = self._proc
+        try:
+            for line in proc.stdout:
+                self.line_arrived.emit(line.rstrip('\r\n'))
+            code = proc.wait()
+        except Exception:
+            code = -1
+        self.run_done.emit(int(code))
+
+    # ---- state for the form and the suite ----------------------------------
+
+    @property
+    def exit_code(self):
+        """The child's exit code, or None while it runs."""
+        return self._exit_code
+
+    @property
+    def transcript(self):
+        """Every line the child printed (the failure boxes quote its
+        tail; the suite pins the whole transcript)."""
+        return list(self._lines)
+
+    def note(self, text):
+        """Appends one explanatory line to the output and the transcript
+        (the form's phase announcements: the venv module prints NOTHING
+        for most of its ~40 s creation run, so without notes the dialog
+        sits silent and looks stuck). GUI-thread only -- the form calls
+        it around the child's own lines, which arrive queued."""
+        self._on_line_arrived(text)
+
+    @property
+    def was_cancelled(self):
+        return self._cancelled
+
+    def _on_line_arrived(self, line):
+        self._lines.append(line)
+        self.output.append(line)
+
+    def _on_run_done(self, code):
+        self._exit_code = int(code)
+        self.progress.hide()
+        self.cancel_button.hide()
+        self.close_button.show()
+        self.close_button.setDefault(True)
+        self.close_button.setFocus()
+
+    def _on_cancel(self):
+        if self._exit_code is None and self._proc is not None:
+            self._cancelled = True
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+
+    def reject(self):
+        # Esc / the window's X while the child runs would close the
+        # dialog with the reader still attached: refuse it (Cancel is
+        # the way out of a running child; after it ends, reject closes
+        # normally).
+        if self._exit_code is None and self._proc is not None:
+            return
+        super().reject()
+
+
+class NewEnvironmentDialog(QDialog):
+    """The '+ New Environment' entry's dialog: one field, the name,
+    validated live against ``notebook_envs.validate_name`` (the reason
+    under the field when invalid, OK disabled until valid), and the
+    honest note that creation takes about a minute. Headless testing:
+    constructed and pinned directly, ``exec()`` never runs in the
+    suite."""
+
+    def __init__(self, root, parent=None):
+        super().__init__(parent)
+        self.setObjectName('env_dialog')
+        self.setStyleSheet(_DIALOG_STYLESHEET)
+        self.setWindowTitle('New Python environment')
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        self._root = root
+
+        self.name_edit = QLineEdit(self)
+        self.name_edit.setObjectName('name_edit')
+        self.name_edit.setPlaceholderText('name (letters, digits, . _ -)')
+        self.message_label = QLabel('', self)
+        self.message_label.setObjectName('name_message')
+        self.message_label.setWordWrap(True)
+        self.note_label = QLabel(
+            'The environment is created with Dragonfly\'s Python and its '
+            'own pip. Creation takes about a minute; packages can be pip '
+            'installed into it afterwards.', self)
+        self.note_label.setObjectName('name_note')
+        self.note_label.setWordWrap(True)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel, self)
+        self.buttons.setObjectName('dialog_buttons')
+        self.ok_button = self.buttons.button(
+            QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setEnabled(False)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.name_edit.textChanged.connect(self._revalidate)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        form.addRow('Name', self.name_edit)
+        layout.addLayout(form)
+        layout.addWidget(self.message_label)
+        layout.addWidget(self.note_label)
+        layout.addWidget(self.buttons)
+        # A pristine empty field never emits textChanged, so the opening
+        # state validates here: the reason sits under the field from the
+        # first paint instead of a disabled OK with no explanation.
+        self._revalidate()
+
+    def _revalidate(self):
+        try:
+            notebook_envs.validate_name(self.name_edit.text(), self._root)
+        except ValueError as exc:
+            self.message_label.setText(str(exc))
+            self.ok_button.setEnabled(False)
+            return
+        self.message_label.setText('')
+        self.ok_button.setEnabled(True)
+
+    def environment_name(self):
+        """The validated name (empty when nothing valid was entered)."""
+        try:
+            return notebook_envs.validate_name(self.name_edit.text(),
+                                               self._root)
+        except ValueError:
+            return ''
+
+
+def new_environment_dialog(root, parent=None):
+    """Runs the New Environment dialog modally; returns the validated
+    name, or None when the user cancelled (the ONE failure box for a
+    construction failure is already shown)."""
+    try:
+        dialog = NewEnvironmentDialog(root, parent)
+    except Exception as exc:
+        _show_message(parent,
+                      'the New Environment dialog could not be opened: {}'
+                      .format(exc))
+        return None
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return dialog.environment_name() or None
+
+
+class PipCommandDialog(QDialog):
+    """The pip button's dialog: one field taking the FULL pip command
+    (``pip install yfinance``, ``pip uninstall numpy``, ``pip list``; a
+    leading ``python -m pip`` is tolerated and stripped, and the bare
+    ``install yfinance`` spelling works too). OK stays disabled until
+    the field holds a pip command. Headless testing: constructed and
+    pinned directly, ``exec()`` never runs in the suite."""
+
+    def __init__(self, environment_name, parent=None):
+        super().__init__(parent)
+        self.setObjectName('env_dialog')
+        self.setStyleSheet(_DIALOG_STYLESHEET)
+        self.setWindowTitle('pip in \'{}\''.format(environment_name))
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        self.command_edit = QLineEdit(self)
+        self.command_edit.setObjectName('command_edit')
+        self.command_edit.setPlaceholderText(
+            'e.g. pip install yfinance, pip uninstall numpy, pip list')
+        self.message_label = QLabel('', self)
+        self.message_label.setObjectName('command_message')
+        self.message_label.setWordWrap(True)
+        self.note_label = QLabel(
+            'Runs in the environment \'{}\' with its own pip; the output '
+            'streams below the field while it runs. Pip commands do not '
+            'run from cells. (An update runs as install --upgrade; an '
+            'uninstall is confirmed automatically.)'.format(
+                environment_name), self)
+        self.note_label.setObjectName('command_note')
+        self.note_label.setWordWrap(True)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel, self)
+        self.buttons.setObjectName('dialog_buttons')
+        self.ok_button = self.buttons.button(
+            QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setEnabled(False)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.command_edit.textChanged.connect(self._revalidate)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        form.addRow('Command', self.command_edit)
+        layout.addLayout(form)
+        layout.addWidget(self.message_label)
+        layout.addWidget(self.note_label)
+        layout.addWidget(self.buttons)
+        # The same opening-state validation as the New Environment dialog:
+        # the empty pristine field never emits textChanged.
+        self._revalidate()
+
+    def _revalidate(self):
+        # the dialog's own gate is the SAME normalization the run uses
+        # (notebook_envs.pip_command_words): a command that is only
+        # launcher spellings never reaches OK
+        try:
+            notebook_envs.pip_command_words(self.command_edit.text())
+        except ValueError:
+            self.message_label.setText('Enter the pip command (for '
+                                       'example: pip install yfinance).')
+            self.ok_button.setEnabled(False)
+            return
+        self.message_label.setText('')
+        self.ok_button.setEnabled(True)
+
+    def command(self):
+        """The command text as typed (``pip_command`` normalizes the
+        launcher spellings and the aliases when it builds the argv)."""
+        return self.command_edit.text().strip()
+
+
+def pip_command_text(environment_name, parent=None):
+    """Runs the pip dialog modally; returns the command text as typed,
+    or None when the user cancelled (the ONE failure box for a
+    construction failure is already shown)."""
+    try:
+        dialog = PipCommandDialog(environment_name, parent)
+    except Exception as exc:
+        _show_message(parent,
+                      'the pip dialog could not be opened: {}'.format(exc))
+        return None
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return dialog.command() or None
+
+
+class DeleteEnvironmentDialog(QDialog):
+    """The '- Delete Environment' picker (round 18): the environment
+    list as one QListWidget on the plugin's dark dialog stylesheet --
+    the plain ``QInputDialog.getItem`` it replaced never took the
+    stylesheet and stood out against every other dialog of the flow.
+    One row per existing environment, the first pre-selected, OK
+    enabled while a row is selected (an empty list never opens: the
+    delete flow refuses it before constructing this). Headless testing:
+    constructed and pinned directly, ``exec()`` never runs in the
+    suite."""
+
+    def __init__(self, names, parent=None):
+        super().__init__(parent)
+        self.setObjectName('env_dialog')
+        self.setStyleSheet(_DIALOG_STYLESHEET)
+        self.setWindowTitle('Dragonfly Notebook')
+        self.setModal(True)
+        self.setMinimumWidth(380)
+
+        self.prompt_label = QLabel('Environment to delete:', self)
+        self.prompt_label.setObjectName('delete_prompt')
+        self.env_list = QListWidget(self)
+        self.env_list.setObjectName('env_delete_list')
+        for name in names:
+            QListWidgetItem(name, self.env_list)
+        self.env_list.setCurrentRow(0 if names else -1)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel, self)
+        self.buttons.setObjectName('dialog_buttons')
+        self.ok_button = self.buttons.button(
+            QDialogButtonBox.StandardButton.Ok)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.env_list.currentRowChanged.connect(self._revalidate)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.prompt_label)
+        layout.addWidget(self.env_list)
+        layout.addWidget(self.buttons)
+        # The opening-state gate (the same pattern as the two input
+        # dialogs above): the pre-selected row must reach OK from the
+        # first paint.
+        self._revalidate(self.env_list.currentRow())
+
+    def _revalidate(self, row):
+        """OK follows the selection: an environment must be picked (the
+        current row changed signal carries the new row)."""
+        self.ok_button.setEnabled(row >= 0)
+
+    def selected_environment(self):
+        """The picked name ('' when nothing is selected)."""
+        item = self.env_list.currentItem()
+        return item.text() if item is not None else ''
+
+
+def delete_environment_dialog(names, parent=None):
+    """Runs the delete picker modally; returns the picked environment
+    name, or None when the user cancelled (the ONE failure box for a
+    construction failure is already shown)."""
+    try:
+        dialog = DeleteEnvironmentDialog(names, parent)
+    except Exception as exc:
+        _show_message(parent,
+                      'the delete-environment dialog could not be opened: '
+                      '{}'.format(exc))
+        return None
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return dialog.selected_environment() or None
+
+
+# ---------------------------------------------------------------------------
 # the form
 # ---------------------------------------------------------------------------
 
@@ -1237,7 +1759,7 @@ class DragonflyNotebookForm(QMainWindow):
         self._running = False            # a cell (or Run All) is executing
         self._rebuilding = False         # suppresses spurious dirty flags
         self._running_cell_index = -1    # the cell currently running
-        self._run_started_at = 0.0       # time.monotonic() at the run start
+        self._run_started_at = 0.0        # time.monotonic() at the run start
         self._run_advance = False        # Shift+Enter pending for the run
         self._run_insert_after = False   # Alt+Enter pending for the run
         # The Run All chain: the runs are ASYNCHRONOUS now, so the chain
@@ -1247,6 +1769,18 @@ class DragonflyNotebookForm(QMainWindow):
         self._run_all_total = 0
         self._run_all_ran = 0
         self._smoke_ticks = 0            # DFNB_SMOKE: live-tick counter
+
+        # Round 16: the environment state. The combo (built in
+        # _build_ui's toolbar row) lists the embedded Python first,
+        # then every environment under the root, then '+ New
+        # Environment'; ``_selected_environment`` is the environment
+        # NAME (None = embedded), stored per notebook in the document's
+        # metadata. ``_env_install_running`` is True while a venv
+        # creation or pip child of THIS window streams (the controls
+        # rule refuses a second one).
+        self._envs_root = notebook_envs.envs_root()
+        self._selected_environment = None
+        self._env_install_running = False
 
         # Round 11, the markdown cell modes: the ids of the markdown cells
         # currently in EDIT mode (source editor visible, rendered browser
@@ -1267,9 +1801,13 @@ class DragonflyNotebookForm(QMainWindow):
         self.setAcceptDrops(True)
 
         self._build_ui()
+        # Round 16: fill the environment combo (embedded + discovered
+        # environments + '+ New Environment'); the selection starts at
+        # the embedded Python (the default for a fresh notebook).
+        self._refresh_env_list()
         self._rebuild_cells()
         self._update_title()
-        self._set_status('New notebook — kernel starts on the first run.')
+        self._set_status('New notebook -- kernel starts on the first run.')
 
         # First connection attempt: the exact pipe the launcher passed
         # (never a discovery pass at startup -- a sibling Dragonfly
@@ -1301,7 +1839,7 @@ class DragonflyNotebookForm(QMainWindow):
         # moment it drops (Dragonfly closed or restarted) and hidden again
         # on reconnect.
         self._disconnected_banner = QLabel(
-            'Dragonfly is disconnected — dfnb calls fail until the bridge '
+            'Dragonfly is disconnected -- dfnb calls fail until the bridge '
             'is back. The notebook reconnects automatically once Dragonfly '
             'is up again.', self)
         self._disconnected_banner.setObjectName('disconnected_banner')
@@ -1363,17 +1901,23 @@ class DragonflyNotebookForm(QMainWindow):
         self.busy_bar.setTextVisible(False)
         self.busy_bar.setFixedWidth(140)
         self.busy_bar.hide()
+        # Round 16: the environment name sits in the status strip next
+        # to the busy bar (the kernel status text stays what it was).
+        self._env_label = QLabel(self)
+        self._env_label.setObjectName('env_label')
+        self._update_env_label()
         status_strip = QFrame(self)
         status_strip.setObjectName('status_strip')
         strip_layout = QHBoxLayout(status_strip)
         strip_layout.setContentsMargins(0, 4, 0, 0)
         strip_layout.addWidget(self.status_label)
         strip_layout.addStretch(1)
+        strip_layout.addWidget(self._env_label)
         strip_layout.addWidget(self.busy_bar)
         outerLayout.addWidget(status_strip)
         # The watermark is the LAST widget of the outer layout: below the
         # status strip, always visible (the h5 importer's understated-footer
-        # convention — no print/log/box emission).
+        # convention -- no print/log/box emission).
         self.watermark_label = QLabel(_WATERMARK_TEXT, self)
         self.watermark_label.setObjectName('watermark_label')
         self.watermark_label.setWordWrap(True)
@@ -1452,6 +1996,31 @@ class DragonflyNotebookForm(QMainWindow):
             button.clicked.connect(handler)
             toolbarLayout.addWidget(button)
             self._toolbar_buttons[name] = button
+        # Round 16: the environment picker and the pip button,
+        # after a separator at the row's end. Deliberately NOT in
+        # _toolbar_buttons (that dict is the run-disable sweep, and these
+        # two follow _update_env_controls' own finer rule instead).
+        toolbarLayout.addSpacing(6)
+        separator = QFrame(toolbar)
+        separator.setObjectName('toolbar_separator')
+        separator.setFrameShape(QFrame.Shape.NoFrame)
+        separator.setFixedWidth(1)
+        toolbarLayout.addWidget(separator)
+        toolbarLayout.addSpacing(6)
+        self._env_combo = QComboBox(toolbar)
+        self._env_combo.setObjectName('env_combo')
+        self._env_combo.setToolTip(
+            'The Python environment the kernel runs on: Dragonfly\'s '
+            'embedded Python, or one of your custom environments')
+        self._env_combo.currentIndexChanged.connect(self._on_env_selected)
+        toolbarLayout.addWidget(self._env_combo)
+        self._pip_button = QToolButton(toolbar)
+        self._pip_button.setObjectName('pip_button')
+        self._pip_button.setText('pip')
+        self._pip_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._pip_button.setFixedHeight(26)
+        self._pip_button.clicked.connect(self._on_pip_button)
+        toolbarLayout.addWidget(self._pip_button)
         toolbarLayout.addStretch(1)
         return toolbar
 
@@ -1516,6 +2085,7 @@ class DragonflyNotebookForm(QMainWindow):
     def _wire_kernel_signals(self):
         kernel = self.kernel
         kernel.kernel_started.connect(self._on_kernel_started)
+        kernel.kernel_stopped.connect(self._on_kernel_stopped)
         kernel.stream_arrived.connect(self._on_stream_arrived)
         kernel.display_arrived.connect(self._on_display_arrived)
         kernel.result_arrived.connect(self._on_result_arrived)
@@ -1881,7 +2451,7 @@ class DragonflyNotebookForm(QMainWindow):
         """A picker menu entry: the kind's dialog (its object lists read
         THROUGH the bridge), and on OK the generated line at the cursor."""
         if self._running:
-            self._set_status('A cell is running — wait for it.')
+            self._set_status('A cell is running -- wait for it.')
             return
         params = snippet_parameters_dialog(kind, self.client, self)
         if params is None:
@@ -1899,7 +2469,7 @@ class DragonflyNotebookForm(QMainWindow):
         owns and the generated line lands at THIS editor's cursor -- the
         drop target, not the focused cell (the round-4 semantics)."""
         if self._running:
-            self._set_status('A cell is running — wait for it.')
+            self._set_status('A cell is running -- wait for it.')
             return
         params = snippet_parameters_dialog(kind, self.client, self)
         if params is None:
@@ -1910,6 +2480,577 @@ class DragonflyNotebookForm(QMainWindow):
         self._set_status('Snippet inserted: {}.'
                          .format(SNIPPET_SPECS[kind]['label']))
 
+    # ------------------------------------------------------ environments
+
+    def _refresh_env_list(self):
+        """Rebuilds the environment combo: the embedded Python entry,
+        every discovered environment (sorted), a separator, and the two
+        administrative entries ('+ New Environment', '- Delete
+        Environment'). The fill is programmatic with signals blocked
+        (the selection handler is for USER picks only); the current
+        selection is restored afterwards, so a refresh cannot silently
+        switch the notebook's environment."""
+        combo = self._env_combo
+        names = notebook_envs.list_environments(self._envs_root)
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem(notebook_envs.EMBEDDED_LABEL, None)
+            for name in names:
+                combo.addItem(name, name)
+            if names:
+                combo.insertSeparator(combo.count())
+            combo.addItem(notebook_envs.NEW_ENV_LABEL,
+                           notebook_envs.NEW_ENV_SENTINEL)
+            combo.addItem(notebook_envs.DELETE_ENV_LABEL,
+                          notebook_envs.DELETE_ENV_SENTINEL)
+            index = 0
+            if self._selected_environment is not None:
+                found = combo.findData(self._selected_environment)
+                if found >= 0:
+                    index = found
+            combo.setCurrentIndex(index)
+        finally:
+            combo.blockSignals(False)
+        self._update_env_controls()
+
+    def _revert_env_combo(self):
+        """Puts the combo back on the current selection (after a
+        cancelled creation or a refused switch), silently."""
+        combo = self._env_combo
+        target = 0
+        if self._selected_environment is not None:
+            found = combo.findData(self._selected_environment)
+            if found >= 0:
+                target = found
+        combo.blockSignals(True)
+        try:
+            combo.setCurrentIndex(target)
+        finally:
+            combo.blockSignals(False)
+        self._update_env_controls()
+
+    def _on_env_selected(self, index):
+        """The combo's handler for USER picks: '+ New Environment' opens
+        the creation flow and '- Delete Environment' the delete flow
+        (a cancel reverts the combo); any environment (or the embedded
+        Python) switches this notebook to it, with one confirmation when
+        a kernel has to be shut down for the switch. Refused while a cell
+        runs (the combo is disabled then, but the guard keeps the handler
+        honest for programmatic changes)."""
+        if self._running:
+            self._set_status('A cell is running; wait for it.')
+            self._revert_env_combo()
+            return
+        data = self._env_combo.itemData(index)
+        if data == notebook_envs.NEW_ENV_SENTINEL:
+            app = QApplication.instance()
+            if app is not None and app.property('running_in_test'):
+                _log.info('Dragonfly Notebook: the new-environment dialog '
+                          'is suppressed under test (a programmatic combo '
+                          'pick reached the handler).')
+                self._revert_env_combo()
+                return
+            self._create_environment_dialog()
+            return  # the creation flow ends by selecting or reverting
+        if data == notebook_envs.DELETE_ENV_SENTINEL:
+            app = QApplication.instance()
+            if app is not None and app.property('running_in_test'):
+                _log.info('Dragonfly Notebook: the delete-environment '
+                          'dialog is suppressed under test (a '
+                          'programmatic combo pick reached the handler).')
+                self._revert_env_combo()
+                return
+            self._delete_environment_dialog()
+            return  # the delete flow ends by refreshing or reverting
+        name = data  # None = the embedded Python
+        if name == self._selected_environment:
+            return
+        if not self._confirm_environment_switch(name):
+            self._revert_env_combo()
+            return
+        self._apply_environment(name, mark_dirty=True)
+
+    def _confirm_environment_switch(self, name):
+        """One box before a switch that must shut a started kernel down
+        (the in-process shell cannot re-point its imports); under the
+        suite seam (running_in_test) the answer is a logged yes so the
+        switch pins run headless."""
+        if not self.kernel.is_started:
+            return True
+        target = (notebook_envs.EMBEDDED_LABEL if name is None
+                  else "the environment '{}'".format(name))
+        message = ('Switching to {} restarts the kernel: the namespace is '
+                   'wiped (the notebook and its cells are not touched). '
+                   'Continue?'.format(target))
+        app = QApplication.instance()
+        if app is None or app.property('running_in_test'):
+            _log.info('Dragonfly Notebook: environment-switch confirm '
+                      'auto-accepted under test: %s', message)
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle('Dragonfly Notebook')
+        box.setObjectName('dfnb_message')
+        box.setStyleSheet(_DIALOG_STYLESHEET)
+        box.setText(message)
+        switch_button = box.addButton('Switch and restart kernel',
+                                      QMessageBox.ButtonRole.YesRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(switch_button)
+        box.exec()
+        return box.clickedButton() is switch_button
+
+    def _apply_environment(self, name, mark_dirty=True):
+        """The ONE environment-switch authority: the selection, the
+        document's metadata (the notebook remembers its environment
+        across saves), the kernel's next activation, the combo, the
+        status label and the pip button rule all follow. ``name`` is
+        the environment name, or None for the embedded Python. A
+        started kernel on a DIFFERENT environment is shut down (the
+        confirm happened in the caller for user switches; a document
+        load or a new notebook does it silently); the next run
+        lazy-starts on the new environment."""
+        self._selected_environment = name
+        if mark_dirty:
+            self.document.is_dirty = True
+        if name is None:
+            self.document.metadata.pop('dfnb_environment', None)
+        else:
+            self.document.metadata['dfnb_environment'] = name
+        venv = (notebook_envs.env_dir(self._envs_root, name)
+                if name is not None else None)
+        if self.kernel.is_started and \
+                self.kernel.active_environment != venv:
+            self.kernel.shutdown()
+        self.kernel.set_environment(venv)
+        combo = self._env_combo
+        combo.blockSignals(True)
+        try:
+            target = 0 if name is None else combo.findData(name)
+            if target < 0:
+                target = 0
+            combo.setCurrentIndex(target)
+        finally:
+            combo.blockSignals(False)
+        self._update_env_label()
+        self._update_env_controls()
+
+    def _update_env_label(self):
+        """The status strip's environment name."""
+        self._env_label.setText('env: {}'.format(
+            notebook_envs.EMBEDDED_LABEL
+            if self._selected_environment is None
+            else self._selected_environment))
+
+    def _update_env_controls(self):
+        """The environment controls' rule, in one place. The combo
+        disables while a cell runs (a switch mid-run would race the
+        worker) or while a venv/pip child of this window streams. The
+        pip button enables while a CUSTOM environment is selected and
+        nothing of this window is running -- round 18 dropped the
+        in-use-kernel condition from the disable set: a cell run
+        lazy-starts the kernel and it STAYS started, so the old rule
+        locked the button permanently after the first cell and a kernel
+        restart (which keeps the lock by design, the namespace wipe is
+        in place) could never clear it. The kernel hold surfaces as a
+        tooltip note instead: a running kernel keeps its DLLs loaded,
+        so a pip command that replaces them can fail with a Windows
+        file-in-use error (the streaming dialog shows pip's own
+        diagnostic when it does; restarting the kernel first is the
+        clean path). The tooltip always says which rule currently
+        holds."""
+        name = self._selected_environment
+        busy = self._running or self._env_install_running
+        self._env_combo.setEnabled(not busy)
+        reasons = []
+        if name is None:
+            reasons.append('select a custom environment first (the '
+                            'embedded Python is not pip-installable)')
+        if self._running:
+            reasons.append('a cell is running')
+        if self._env_install_running:
+            reasons.append('an environment operation is already running')
+        self._pip_button.setEnabled(not reasons)
+        if reasons:
+            self._pip_button.setToolTip('pip: {}'.format(
+                '; '.join(reasons)))
+        else:
+            tooltip = ("run a pip command in the environment '{}' "
+                       '(with its own pip)'.format(name))
+            if notebook_envs.is_environment_in_use(
+                    notebook_envs.env_dir(self._envs_root, name)):
+                tooltip += ('. Note: a kernel is running on this '
+                            'environment and holds its DLLs loaded; a '
+                            'pip command that replaces them can fail '
+                            'with a Windows file-in-use error (restart '
+                            'the kernel first if that happens)')
+            self._pip_button.setToolTip(tooltip)
+
+    def _on_kernel_stopped(self):
+        """The environment-switch seam landed (or the kernel was shut
+        down): the in-use lock is free, so the pip rule re-checks."""
+        self._update_env_controls()
+
+    def _stop_kernel_and_wait(self, timeout_s=30.0):
+        """Stops THIS window's kernel and waits (bounded) for the worker's
+        teardown to land -- round 18's delete-with-running-kernel seam,
+        the same shutdown the environment switch uses. ``shutdown()``
+        only QUEUES the teardown on the worker thread (the child quits
+        inside a bounded wait, the in-use lock frees inside the
+        teardown, then ``kernel_stopped`` announces it), so the delete
+        flow pumps the GUI thread's own event delivery in a bounded
+        ``QEventLoop`` until the announcement arrives. Returns True
+        when the kernel is stopped when the wait ends; a timeout leaves
+        the caller to the refusal path (the lock probe decides)."""
+        if not self.kernel.is_started:
+            return True
+        loop = QEventLoop()
+        stopped = QTimer()
+        stopped.setSingleShot(True)
+        stopped.timeout.connect(loop.quit)
+        self.kernel.kernel_stopped.connect(loop.quit)
+        try:
+            stopped.start(int(timeout_s * 1000))
+            self.kernel.shutdown()
+            loop.exec()
+        finally:
+            stopped.stop()
+            try:
+                self.kernel.kernel_stopped.disconnect(loop.quit)
+            except TypeError:
+                pass  # already disconnected (the loop timed out first)
+        return not self.kernel.is_started
+
+    def _env_run_dialog(self, title, intro_notes, argv, result_note):
+        """One streaming environment run's dialog, with the phase text
+        the run itself does not print (``python -m venv`` is silent for
+        most of its ~40 s run, so the notes are what tells the user that
+        things are happening; that phase text is the round-16
+        addition). The intro notes
+        land BEFORE the child starts, the exit-code note when the run
+        ends. The caller owns the modal ``exec()``; the headless tier-3
+        gate drives the returned dialog directly through ``start`` + the
+        event pump, never ``exec()``. Returns None when the child could
+        not be spawned at all (the OSError :func:`notebook_envs.popen`
+        raises, e.g. the venv's interpreter deleted between the
+        selection and the click): the caller's ``dialog is None``
+        branch owns the status line and the one failure box, so the
+        exception's text rides there on ``_env_spawn_error`` instead of
+        being lost with the discarded dialog. One catch here covers the
+        creation, the pip run and every future environment run, because
+        they all flow through this helper."""
+        dialog = _EnvProcessDialog(title, self)
+        for text in intro_notes:
+            dialog.note(text)
+        dialog.run_done.connect(
+            lambda code: dialog.note(result_note(code)))
+        self._env_spawn_error = None
+        try:
+            dialog.start(argv)
+        except OSError as exc:
+            self._env_spawn_error = str(exc)
+            return None
+        return dialog
+
+    def _creation_run_dialog(self, name, venv):
+        """The creation run's dialog: title, the two phase notes (what
+        the silent venv module is about to do, and for roughly how long),
+        the venv argv, and the exit-code note that ends the
+        transcript."""
+        return self._env_run_dialog(
+            "Creating environment '{}'...".format(name),
+            ["Creating the virtual environment '{}' "
+             '(python -m venv).'.format(name),
+             'This step prints nothing on its own: the interpreter is '
+             'copied and pip is bootstrapped into the new environment '
+             'first (about a minute on this machine). The exit code at '
+             'the end is the success signal.'],
+            notebook_envs.venv_creation_command(venv),
+            lambda code: (
+                'The environment was created (exit code {}).'.format(code)
+                if code == 0 else
+                'The creation stopped with exit code {}.'.format(code)))
+
+    def _pip_run_dialog(self, name, venv, command):
+        """The pip run's dialog: title, the one-line intro naming the
+        command as typed, the venv's own pip argv
+        (:func:`notebook_envs.pip_command` normalizes the launcher
+        spellings and the aliases), and the exit-code note."""
+        return self._env_run_dialog(
+            "pip in '{}'...".format(name),
+            ["Running the environment's own pip: {}.".format(command)],
+            notebook_envs.pip_command(venv, command),
+            lambda code: (
+                'The pip command finished (exit code {}).'.format(code)
+                if code == 0 else
+                'The pip command stopped with exit code {}.'.format(code)))
+
+    def _base_install_run_dialog(self, name, venv, packages=None):
+        """The base-package install run's dialog (the second half of a
+        creation, round 17: a fresh environment gets numpy and pandas,
+        the minimum the notebook's own data paths need). ``packages``
+        defaults to the notebook contract; the tier-3 gate overrides it
+        with an offline wheel so the pin needs no network."""
+        if packages is None:
+            packages = list(notebook_envs.BASE_PACKAGES)
+        return self._env_run_dialog(
+            "Installing the base packages into '{}'...".format(name),
+            ['Installing the base packages the notebook needs ({}): '
+             'numpy arrays carry the volumes, pandas DataFrames carry '
+             'the measured properties.'.format(', '.join(packages)),
+             'This downloads them from PyPI the first time and can take '
+             'a few minutes; later environments reuse pip\'s download '
+             'cache. The exit code at the end is the success signal.'],
+            notebook_envs.pip_install_command(venv, packages),
+            lambda code: (
+                'The base packages were installed (exit code {}).'
+                .format(code)
+                if code == 0 else
+                'The base package install stopped with exit code {}.'
+                .format(code)))
+
+    def _create_environment_dialog(self):
+        """The '+ New Environment' flow: the name dialog, then the
+        streaming creation. A cancel (or a construction failure) reverts
+        the combo; a successful creation selects the new environment."""
+        name = new_environment_dialog(self._envs_root, self)
+        if not name:
+            self._revert_env_combo()
+            return
+        self._create_environment(name)
+
+    def _create_environment(self, name):
+        """Creates one environment: the ~40 s no-window venv creation
+        streamed into a modal dialog, then (round 17) the base-package
+        install (numpy, pandas) streamed the same way, then the
+        selection follows. A failed or cancelled CREATION removes the
+        partial venv and keeps the previous selection; a failed base
+        install keeps the (perfectly valid) environment and says how to
+        retry. Both runs stream with ``_env_install_running`` set, so
+        the pip button and the combo are locked from the first dialog
+        to the last."""
+        try:
+            notebook_envs.validate_name(name, self._envs_root)
+        except ValueError as exc:
+            _show_message(self, str(exc))
+            self._revert_env_combo()
+            return
+        venv = notebook_envs.env_dir(self._envs_root, name)
+        self._env_install_running = True
+        self._update_env_controls()
+        dialog = None
+        base_dialog = None
+        try:
+            dialog = self._creation_run_dialog(name, venv)
+            if dialog is not None:
+                dialog.exec()
+                if dialog.exit_code == 0:
+                    # round 17: the runtime DLL the child's sqlite3 needs
+                    # (instant, idempotent), then the base packages
+                    notebook_envs.ensure_runtime_dlls(venv)
+                    base_dialog = self._base_install_run_dialog(name, venv)
+                    if base_dialog is not None:
+                        base_dialog.exec()
+        finally:
+            # a spawn failure must not wedge the controls for the rest
+            # of the window's life: the flag drops whatever happened (a
+            # spawn failure makes the run helper return None, and the
+            # branch below reports it as the failed run it promised)
+            self._env_install_running = False
+        if dialog is None:
+            shutil.rmtree(venv, ignore_errors=True)
+            self._set_status("The environment '{}' was not created: the "
+                             'process could not start.'.format(name))
+            _show_message(
+                self, "The environment '{}' could not be created: the "
+                'process could not start ({}).'.format(
+                    name, self._env_spawn_error))
+            self._refresh_env_list()
+            return
+        if dialog.exit_code != 0:
+            # a half-created venv is not an environment: remove it so
+            # the name is free again (and discovery never offers it)
+            shutil.rmtree(venv, ignore_errors=True)
+            detail = ('cancelled' if dialog.was_cancelled
+                      else 'the creation failed (exit {})'.format(
+                          dialog.exit_code))
+            self._set_status("The environment '{}' was not created: {}."
+                             .format(name, detail))
+            if not dialog.was_cancelled:
+                _show_message(
+                    self, "The environment '{}' could not be created:\n{}"
+                    .format(name,
+                            '\n'.join(dialog.transcript[-12:])
+                            or 'no output'))
+        elif base_dialog is None or base_dialog.exit_code != 0:
+            # the venv exists and runs; only its base packages are
+            # missing. Keep it, keep the name, say how to retry.
+            if base_dialog is None:
+                detail = 'the install process could not start'
+            elif base_dialog.was_cancelled:
+                detail = 'the install was cancelled'
+            else:
+                detail = 'exit code {}'.format(base_dialog.exit_code)
+            self._set_status(
+                "Environment '{}' was created, but its base packages "
+                '({}) did not finish installing ({}). Retry with the pip '
+                'button.'.format(
+                    name, ', '.join(notebook_envs.BASE_PACKAGES), detail))
+        else:
+            self._set_status("Environment '{}' created with the base "
+                             'packages installed. The kernel runs on it; '
+                             'the pip button installs into it.'.format(name))
+        self._refresh_env_list()
+        if dialog.exit_code == 0:
+            self._apply_environment(name, mark_dirty=True)
+
+    def _delete_environment_dialog(self):
+        """The '- Delete Environment' flow: pick one of the existing
+        environments (round 18: the styled ``DeleteEnvironmentDialog``
+        list, not the plain ``QInputDialog`` that ignored the plugin's
+        dialog stylesheet), confirm the removal (the disk loss is
+        permanent), delete it. An empty list or a cancel just reverts
+        the combo (the entry is a door, not a state)."""
+        names = notebook_envs.list_environments(self._envs_root)
+        if not names:
+            self._set_status('There are no custom environments to delete.')
+            self._revert_env_combo()
+            return
+        name = delete_environment_dialog(names, self)
+        if not name:
+            self._revert_env_combo()
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle('Dragonfly Notebook')
+        box.setObjectName('dfnb_message')
+        box.setStyleSheet(_DIALOG_STYLESHEET)
+        box.setText("Delete the environment '{}'? Its interpreter and "
+                    'every installed package are removed from disk. '
+                    'This cannot be undone.'.format(name))
+        delete_button = box.addButton('Delete environment',
+                                      QMessageBox.ButtonRole.YesRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(delete_button)
+        box.exec()
+        if box.clickedButton() is not delete_button:
+            self._revert_env_combo()
+            return
+        self._delete_environment(name)
+
+    def _delete_environment(self, name):
+        """Deletes one environment from disk (the confirm already
+        happened in the dialog flow; the tier-3 gate calls this directly
+        with its own throwaway environment). Round 18: a kernel of THIS
+        WINDOW running on the deleted environment is STOPPED first (the
+        same seam the environment switch uses: the queued shutdown tears
+        the environment child down inside its bounded wait and frees the
+        in-use lock, and the delete flow waits for the announcement) --
+        the old unconditional refusal made deletion impossible after
+        running any cell, the common case. The refusal remains only for
+        holds this window cannot safely stop: another notebook window's
+        kernel (the OS lock) or an environment operation of this window
+        still in flight -- the message says which. Deleting the SELECTED
+        environment silently switches this notebook back to the embedded
+        Python (its kernel was just stopped, so the switch never has to
+        shut one down)."""
+        if self._running:
+            self._set_status('A cell is running; wait for it (or press '
+                             'its Stop button) before deleting an '
+                             'environment.')
+            self._revert_env_combo()
+            return
+        if self._env_install_running:
+            self._set_status('An environment operation is already '
+                             'running; wait for it before deleting an '
+                             'environment.')
+            self._revert_env_combo()
+            return
+        venv = notebook_envs.env_dir(self._envs_root, name)
+        if self.kernel.is_started and \
+                self.kernel.active_environment == venv:
+            self._stop_kernel_and_wait()
+        if notebook_envs.is_environment_in_use(venv):
+            self._set_status(
+                "The environment '{}' is in use by another notebook "
+                "window's kernel. Switch that window to the embedded "
+                'Python, or close it, and delete again.'.format(name))
+            self._revert_env_combo()
+            return
+        try:
+            shutil.rmtree(venv)
+        except OSError as exc:
+            self._set_status("The environment '{}' could not be deleted: "
+                             '{}'.format(name, exc))
+            self._revert_env_combo()
+            return
+        if self._selected_environment == name:
+            self._apply_environment(None, mark_dirty=True)
+        self._set_status("The environment '{}' was deleted.".format(name))
+        self._refresh_env_list()
+
+    def _on_pip_button(self):
+        """The pip button (round 17: pip runs ONLY here, never from
+        cells): the full-command dialog, then the venv's own pip
+        streamed into a modal dialog. The button's rule already
+        guaranteed a custom, idle environment when it was clickable
+        (round 18: a running kernel no longer blocks the click -- the
+        tooltip's note names the file-in-use risk instead)."""
+        name = self._selected_environment
+        if name is None or self._running or self._env_install_running:
+            self._update_env_controls()
+            return
+        command = pip_command_text(name, self)
+        if not command:
+            return
+        venv = notebook_envs.env_dir(self._envs_root, name)
+        self._env_install_running = True
+        self._update_env_controls()
+        dialog = None
+        try:
+            dialog = self._pip_run_dialog(name, venv, command)
+            if dialog is not None:
+                dialog.exec()
+        except ValueError as exc:
+            # a command that is only launcher spellings (the dialog's
+            # validation normally refuses it): a status note, not a
+            # crash out of the slot -- the flag drops BEFORE the
+            # re-render so the button rule reads the real state
+            self._env_install_running = False
+            self._set_status('The pip command could not start: '
+                             '{}.'.format(exc))
+            self._update_env_controls()
+            return
+        finally:
+            # the same spawn-failure guarantee as the creation run (a
+            # spawn failure makes the run helper return None, and the
+            # branch below reports it)
+            self._env_install_running = False
+        if dialog is None:
+            self._set_status("The pip command in '{}' did not start."
+                             .format(name))
+            _show_message(
+                self, "The pip command in '{}' did not start: the "
+                'process could not start ({}).'.format(
+                    name, self._env_spawn_error))
+            self._update_env_controls()
+            return
+        if dialog.exit_code == 0:
+            self._set_status("Ran {} in '{}'.".format(command, name))
+        else:
+            detail = ('cancelled' if dialog.was_cancelled
+                      else 'pip failed (exit {})'.format(dialog.exit_code))
+            self._set_status("The pip command in '{}' did not finish: "
+                             '{}.'.format(name, detail))
+            if not dialog.was_cancelled:
+                _show_message(
+                    self, "The pip command in '{}' failed:\n{}"
+                    .format(name,
+                            '\n'.join(dialog.transcript[-12:])
+                            or 'no output'))
+        self._update_env_controls()
+
     # --------------------------------------------------------------- run
 
     def _guard_idle(self):
@@ -1919,7 +3060,7 @@ class DragonflyNotebookForm(QMainWindow):
         which the synchronous rounds could not race (the GUI thread was
         busy inside the run)."""
         if self._running:
-            self._set_status('A cell is running — wait for it (or press '
+            self._set_status('A cell is running -- wait for it (or press '
                              'its Stop button).')
             return False
         return True
@@ -1936,7 +3077,7 @@ class DragonflyNotebookForm(QMainWindow):
         rendered, round 12) or a refused run.
         ``run_total`` (Run All only) labels the status 'cell N of M'."""
         if self._running:
-            self._set_status('A cell is already running — wait for it.')
+            self._set_status('A cell is already running -- wait for it.')
             return False
         if not (0 <= index < self.document.cell_count()):
             return False
@@ -2069,6 +3210,10 @@ class DragonflyNotebookForm(QMainWindow):
             edit_button = record.get('edit_button')
             if edit_button is not None:
                 edit_button.setEnabled(not running)
+        # Round 16: the environment controls re-evaluate (the pip
+        # button's in-use probe must run again now the run is over;
+        # the combo locks while a cell runs).
+        self._update_env_controls()
 
     def _on_live_tick(self):
         """One live-timer tick while a cell runs: updates the running
@@ -2132,7 +3277,7 @@ class DragonflyNotebookForm(QMainWindow):
             self._set_status('Running cell {}...'.format(
                 self._running_cell_index + 1))
         else:
-            self._set_status('Kernel started — ' + self._kernel_status_text())
+            self._set_status('Kernel started -- ' + self._kernel_status_text())
 
     def _on_run_finished(self, count, outputs):
         """The run's end, on the GUI thread (queued from the worker):
@@ -2163,11 +3308,11 @@ class DragonflyNotebookForm(QMainWindow):
         record['elapsed_label'].show()
         if interrupted:
             self._set_status(
-                'Cell [{}] interrupted after {:.1f} s — if a cell seems '
+                'Cell [{}] interrupted after {:.1f} s -- if a cell seems '
                 'stuck (a C extension that never returns), use Restart '
                 'kernel.'.format(index + 1, elapsed))
         else:
-            self._set_status('Cell [{}] done — {}'.format(
+            self._set_status('Cell [{}] done -- {}'.format(
                 count, self._kernel_status_text()))
         advance, insert_after = self._run_advance, self._run_insert_after
         self._run_advance = False
@@ -2197,18 +3342,23 @@ class DragonflyNotebookForm(QMainWindow):
 
     def _on_restart_finished(self, ok, message):
         if ok:
-            self._set_status('Kernel restarted (namespace wiped) — '
+            self._set_status('Kernel restarted (namespace wiped) -- '
                              + self._kernel_status_text())
         else:
             self._set_status('The kernel did not restart: {}'.format(message))
             _show_message(self, 'The kernel did not restart:\n{}'
                           .format(message))
+        # Round 18: the controls re-evaluate at the restart's end too --
+        # the restarted kernel is still a running kernel (the in-use
+        # lock stays held by design), and the pip tooltip's note must
+        # reflect the state the restart actually left.
+        self._update_env_controls()
 
     def _continue_run_all(self, index, interrupted):
         """The Run All chain, advanced from _on_run_finished: the next code
         cell starts on a zero-timer hop (no recursion inside a signal
-        handler); an interrupted cell stops the chain (the user asked for
-        a stop, not for the rest of the notebook)."""
+        handler); an interrupted cell stops the chain (an interrupt is a
+        stop, not the rest of the notebook)."""
         if not self._run_all_active:
             return
         self._run_all_ran += 1
@@ -2221,7 +3371,7 @@ class DragonflyNotebookForm(QMainWindow):
              if self.document.get_cell(i)['cell_type'] == 'code'), None)
         if next_index is None:
             self._run_all_active = False
-            self._set_status('Run All finished ({} code cells) — {}'.format(
+            self._set_status('Run All finished ({} code cells) -- {}'.format(
                 self._run_all_ran, self._kernel_status_text()))
             return
         QTimer.singleShot(0, lambda idx=next_index:
@@ -2295,7 +3445,7 @@ class DragonflyNotebookForm(QMainWindow):
 
     def on_run_all(self):
         if self._running:
-            self._set_status('A cell is already running — wait for it.')
+            self._set_status('A cell is already running -- wait for it.')
             return
         self._sync_editors_to_document()
         total = sum(1 for index in range(self.document.cell_count())
@@ -2312,7 +3462,7 @@ class DragonflyNotebookForm(QMainWindow):
 
     def on_restart_kernel(self):
         if self._running:
-            self._set_status('A cell is still running — wait for it.')
+            self._set_status('A cell is still running -- wait for it.')
             return
         self.kernel.restart()
         self._set_status('Restarting the kernel...')
@@ -2335,14 +3485,14 @@ class DragonflyNotebookForm(QMainWindow):
 
     def _on_client_connected(self):
         self._disconnected_banner.hide()
-        self._set_status('Connected to Dragonfly — ' +
+        self._set_status('Connected to Dragonfly -- ' +
                          self._kernel_status_text())
         if _SMOKE:
             print('DFNB-CONNECTED', flush=True)
 
     def _on_client_disconnected(self):
         self._disconnected_banner.show()
-        self._set_status('Dragonfly disconnected — dfnb calls fail until '
+        self._set_status('Dragonfly disconnected -- dfnb calls fail until '
                          'the bridge is back; reconnecting automatically.')
         if _SMOKE:
             print('DFNB-DISCONNECTED', flush=True)
@@ -2409,9 +3559,12 @@ class DragonflyNotebookForm(QMainWindow):
         # inherit stale ids (inert while ids stay uuid4-unique, but the
         # invariant is the contract, not the coincidence)
         self.file_path = None
+        # Round 16: a fresh notebook runs on the embedded Python (the
+        # default selection; the environment is notebook metadata).
+        self._apply_environment(None, mark_dirty=False)
         self._rebuild_cells()
         self._update_title()
-        self._set_status('New notebook — ' + self._kernel_status_text())
+        self._set_status('New notebook -- ' + self._kernel_status_text())
 
     def _open_document_or_report(self, path):
         """Reads a .ipynb into a NotebookDocument: ONE failure message (an
@@ -2462,11 +3615,33 @@ class DragonflyNotebookForm(QMainWindow):
         # the EDIT set belongs to the previous document, clear it (hygiene
         # against id collisions across notebooks).
         self._markdown_edit_ids.clear()
+        # Round 16: the notebook remembers its environment; restore the
+        # selection. An environment that no longer exists falls back to
+        # the embedded Python with a LOG entry (never a modal box in the
+        # middle of an open; the user sees the fallback in the strip).
+        saved = document.metadata.get('dfnb_environment')
+        name = None
+        fallback_note = None
+        if isinstance(saved, str) and saved:
+            if saved in notebook_envs.list_environments(self._envs_root):
+                name = saved
+            else:
+                _log.info("Dragonfly Notebook: the environment '%s' saved "
+                          'in %s no longer exists; running on the '
+                          'embedded Python.', saved, os.path.basename(path))
+                fallback_note = ("The saved environment '{}' no longer "
+                                 'exists; running on the embedded '
+                                 'Python.'.format(saved))
+        self._apply_environment(name, mark_dirty=False)
         self._rebuild_cells()
         self._update_title()
-        self._set_status('Opened {} ({} cells) — {}'.format(
+        self._set_status('Opened {} ({} cells) -- {}'.format(
             os.path.basename(path), document.cell_count(),
             self._kernel_status_text()))
+        if fallback_note is not None:
+            # the fallback is the LAST word on the strip: the opened-file
+            # status right above would otherwise bury it in the same line
+            self._set_status(fallback_note)
 
     def on_open_notebook(self):
         if not self._guard_idle():
@@ -2487,7 +3662,7 @@ class DragonflyNotebookForm(QMainWindow):
         """Saves (Save As through a dialog when the notebook has no path
         yet). Returns True when the notebook ended up saved."""
         if self._running:
-            self._set_status('A cell is still running — wait for it.')
+            self._set_status('A cell is still running -- wait for it.')
             return False
         self._sync_editors_to_document()
         if self.file_path is None:
@@ -2596,7 +3771,7 @@ class DragonflyNotebookForm(QMainWindow):
             self._set_status('Select a cell first (click into one).')
             return
         if self.document.cell_count() == 1:
-            self._set_status('Cannot delete the last cell — clear it '
+            self._set_status('Cannot delete the last cell -- clear it '
                              'instead.')
             return
         self._sync_editors_to_document()
@@ -2613,12 +3788,12 @@ class DragonflyNotebookForm(QMainWindow):
     def _update_title(self):
         name = os.path.basename(self.file_path) if self.file_path \
             else 'untitled'
-        self.setWindowTitle('Dragonfly Notebook — {}'.format(name))
+        self.setWindowTitle('Dragonfly Notebook -- {}'.format(name))
 
     def closeEvent(self, event):
         if self._running:
             event.ignore()
-            self._set_status('A cell is still running — wait for it to '
+            self._set_status('A cell is still running -- wait for it to '
                              'finish before closing.')
             return
         self._sync_editors_to_document()

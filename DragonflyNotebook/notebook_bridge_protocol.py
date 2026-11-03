@@ -52,7 +52,12 @@ and this module owns everything about the wire format:
 
 Nothing in this module imports ORS or PyQt: it is pure Python + numpy +
 pandas, importable by the plugin, by the standalone app, and by the
-framework-free tier-1 suite.
+framework-free tier-1 suite. numpy binds LAZILY (round 16: a ``_LazyNumpy``
+proxy whose first touch imports it, so the import always lands after the
+DLL-directory registration above; the custom-environment cells now run in
+a subprocess on the venv's own interpreter, and this process's one numpy
+copy stays the embedded one; pandas was always lazy, imported inside
+``decode_value``).
 
 The ``KMP_DUPLICATE_LIB_OK`` guard and the two Dragonfly DLL directories
 are set up before the numpy import, exactly per the platform gauntlet, so
@@ -81,7 +86,34 @@ if os.name == 'nt':
             except OSError:
                 pass
 
-import numpy as np  # noqa: E402  (after the guard / dll dirs, per the rules)
+class _LazyNumpy:
+    """Round 16: numpy binds on the FIRST attribute touch, not at
+    import -- the DLL-directory registration above must run before the
+    import, and nothing in this module needs numpy until a value
+    actually crosses the bridge. (The proxy first existed so an
+    activated custom environment could supply the process's numpy; the
+    environment cells now run in a SUBPROCESS on the venv's own
+    interpreter instead, so this process's one numpy copy stays the
+    embedded one -- the lazy binding still orders the import after the
+    registration.) Until the first touch, every ``np.<attr>`` below
+    rides ``__getattr__``, which imports numpy once and REBINDS the
+    module-global ``np`` to the real module: the indirection is paid
+    exactly once per binding."""
+
+    def __getattr__(self, name):
+        import numpy
+        globals()['np'] = numpy
+        return getattr(numpy, name)
+
+
+np = _LazyNumpy()  # noqa: E402  (after the guard / dll dirs, per the rules)
+
+
+def reset_lazy_numpy():
+    """Re-arms the lazy-numpy proxy (the tier-1 suite pins the proxy's
+    contract through it: the next touch re-imports numpy instead of
+    holding whatever module object was bound before)."""
+    globals()['np'] = _LazyNumpy()
 
 PROTOCOL_VERSION = 1
 

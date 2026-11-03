@@ -5,10 +5,10 @@ Dragonfly's plugin launcher (``DragonflyNotebook.DragonflyNotebook``)
 spawns THIS process detached -- one new notebook window per launcher
 click, several allowed -- with the bridge pipe name as ``argv[1]``
 (``dfnb_bridge_<Dragonfly pid>``). The process is ORS-FREE by design:
-it loads no ORS DLLs, imports no Dragonfly module — it sets
+it loads no ORS DLLs, imports no Dragonfly module -- it sets
 ``DFNB_ORS_FREE_APP=1`` at startup so the package ``__init__`` skips
 the ORS glue's eager re-export by PROCESS IDENTITY, not by ORS
-importability — and talks to Dragonfly only through the bridge client
+importability -- and talks to Dragonfly only through the bridge client
 (``dfnb_client.DfnbClient``, the object the kernel seed pushes as
 ``dfnb``). The editor UI lives
 here (``mainform_dragonflynotebook.DragonflyNotebookForm``) and the
@@ -22,7 +22,7 @@ Smoke hooks (environment-driven, for the tier-3 spawn test -- all prints
 are line-flushed so a piped-stdout harness sees them as they happen):
 
 * ``DFNB_SMOKE``: prints ``DFNB-APP-ORSFREE <True|False>`` right after
-  the package import (``'ORSServiceClass' not in sys.modules`` — the
+  the package import (``'ORSServiceClass' not in sys.modules`` -- the
   process-identity pin: the app process never had ORS loaded), then
   ``DFNB-APP-UP`` (the form is shown), and the
   form-level prints join in -- ``DFNB-BUSY-BAR`` (the busy bar's

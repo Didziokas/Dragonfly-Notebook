@@ -1,6 +1,6 @@
 r"""Dragonfly Notebook: Jupyter-style .ipynb notebooks beside Dragonfly.
 
-Round 8 — the notebook no longer lives inside the Dragonfly process. The
+Round 8 -- the notebook no longer lives inside the Dragonfly process. The
 2026-10-15 live-validation crash (an access violation on Dragonfly's GUI
 thread inside ORS's own paint/UI re-entrancy: a paint pass called an ORS
 Python paintEvent override whose nested PyQt QtGui calls died in Qt6Gui)
@@ -10,24 +10,24 @@ live-UI work re-entrantly and crash the application. Process separation
 removes the whole class by construction:
 
 * THIS module is the Dragonfly-side launcher: the menu item starts the
-  bridge service (``bridge_service`` — a ``QLocalServer`` named
+  bridge service (``bridge_service`` -- a ``QLocalServer`` named
   ``dfnb_bridge_<pid>`` that dispatches dfnb requests to the ORS data
   layer on the GUI thread, one request at a time) and spawns ONE
   standalone notebook application process per click
-  (``notebook_app.py``, DETACHED_PROCESS so no console window appears —
+  (``notebook_app.py``, DETACHED_PROCESS so no console window appears --
   the user's explicit choice). Several notebook windows are simply
   several app processes.
 * The application process never loads ORS: it owns the editor UI and the
   kernel (``notebook_kernel``), and reaches the session only through the
-  bridge client (``dfnb_client``). Dragonfly's GUI stays fully usable —
-  and fully event-pumping — while notebook cells run.
+  bridge client (``dfnb_client``). Dragonfly's GUI stays fully usable --
+  and fully event-pumping -- while notebook cells run.
 
 Round 9 adds the .ipynb drop entry: an application-level Qt event filter
 (``_IpynbDropFilter``) intercepts file drags anywhere in Dragonfly and,
 when the drag carries ONLY local .ipynb URLs (the shared
 ``notebook_drop_policy`` decision), consumes it BEFORE the app's C++
 file-drop dispatcher (which has hardcoded extension lists and no hook a
-plugin could register .ipynb with — probed round 9) and launches the
+plugin could register .ipynb with -- probed round 9) and launches the
 notebook application with the dropped file. The filter is installed when
 the first plugin instance starts and removed when the last one goes.
 Every other drag returns False from the filter and hits the platform
@@ -39,7 +39,7 @@ ORS auto-imports of the Dragonfly process must not apply there) and
 and sets ``KMP_DUPLICATE_LIB_OK`` per the platform gauntlet.
 
 Cleanup: when the plugin instance goes away (Dragonfly closing) its child
-process is killed and — when no instance is left — the bridge is closed;
+process is killed and -- when no instance is left -- the bridge is closed;
 a client that loses the pipe shows its disconnected state and reconnects
 if Dragonfly (and a click on the menu) comes back.
 
@@ -262,7 +262,7 @@ class DragonflyNotebook(OrsPlugin):
 
     # NO UIDescriptors since round 8: there is no in-process form to dock.
     # (getMainFormName() then returns None and startupDefault opens no
-    # widget — the launcher spawns the app process instead.)
+    # widget -- the launcher spawns the app process instead.)
     UIDescriptors = []
 
     def __init__(self, *args, **kwargs):

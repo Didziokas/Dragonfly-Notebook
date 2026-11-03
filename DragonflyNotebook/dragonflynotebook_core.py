@@ -59,7 +59,7 @@ import uuid
 # it (mainform). The two processes never see each other's modules -- the
 # notebook application process imports no ORS glue -- so the version
 # lives here, in the one module both import, and can never drift.
-__version__ = '0.6.3'
+__version__ = '0.7.3'
 
 # Same multiple-OpenMP-runtime workaround as every module in this project:
 # this module itself imports no numpy, but it is the FIRST line of the core
@@ -509,8 +509,8 @@ def generate_snippet(kind, variable=None, source=None, timestep=0, title=None,
     :param array: the kernel variable holding the numpy array to publish
     :param wipe: the export kind's replace-all flag for mode A (write into
                  an EXISTING MultiROI): appended as ``wipe=True`` only when
-                 True (the timestep-nonzero convention — generated lines
-                 stay minimal); mode B (publish) NEVER renders it — a wipe
+                 True (the timestep-nonzero convention -- generated lines
+                 stay minimal); mode B (publish) NEVER renders it -- a wipe
                  is meaningless alongside an array (the fresh MultiROI has
                  no existing properties to replace), so a wipe passed with
                  an array is simply not emitted
@@ -521,7 +521,7 @@ def generate_snippet(kind, variable=None, source=None, timestep=0, title=None,
 
     The export kind generates one of TWO lines: without ``array`` it writes
     into an EXISTING MultiROI (a bare ``dfnb.export_measured_properties``
-    call — the function returns None, so no assignment target); with
+    call -- the function returns None, so no assignment target); with
     ``array`` it publishes a NEW MultiROI from the array and carries the
     properties (``dfnb.publish_np_as_multiroi(..., properties=<variable>)``).
     """

@@ -1,7 +1,7 @@
 r"""The ``dfnb`` client of the standalone notebook application.
 
 Round 8: the notebook editor and its IPython kernel live in their own
-process; ``dfnb`` is no longer the ORS data module but THIS client — same
+process; ``dfnb`` is no longer the ORS data module but THIS client -- same
 eleven public signatures, same validation texts, same behavior from a cell's
 point of view, but every call crosses a Qt named pipe to the bridge service
 running inside Dragonfly (``bridge_service`` + the handlers in
@@ -11,22 +11,22 @@ PyQt6 + numpy + pandas + the shared protocol.
 The public surface (identical signatures and texts to the data layer):
 
 * ``import_volume_as_np(source, timestep=0)`` / ``import_roi_as_np`` /
-  ``import_multiroi_as_np`` — the resolved object's data as a fresh numpy
+  ``import_multiroi_as_np`` -- the resolved object's data as a fresh numpy
   array (a real copy: the service ``numpy.save``s it across the pipe);
 * ``publish_np_as_volume(array, title=None, reference=None, spacing=None)``,
   ``publish_np_as_roi(...)``, ``publish_np_as_multiroi(..., properties=...)``
-  — return a published-object handle: a ``{'guid', 'title', 'class_name'}``
+  -- return a published-object handle: a ``{'guid', 'title', 'class_name'}``
   dict that later ``source`` / ``reference`` parameters re-accept (an object
   does not cross the pipe; its GUID does);
-* ``import_measured_properties(source, properties=None, timestep=0)`` — a
+* ``import_measured_properties(source, properties=None, timestep=0)`` -- a
   ``pandas.DataFrame``;
 * ``export_measured_properties(source, properties, timestep=0,
-  wipe=False)`` — ``None`` (``wipe=True`` replaces ALL existing measured
+  wipe=False)`` -- ``None`` (``wipe=True`` replaces ALL existing measured
   properties; validation fails fast before anything is wiped);
-* ``list_measured_properties(source, timestep=0)`` — column names;
-* ``list_objects(class_name='Channel', representable_only=True)`` — the
+* ``list_measured_properties(source, timestep=0)`` -- column names;
+* ``list_objects(class_name='Channel', representable_only=True)`` -- the
   ``{'guid', 'title', 'class_name'}`` dicts of the live objects;
-* ``delete_object(source)`` — deletes one object from the session by
+* ``delete_object(source)`` -- deletes one object from the session by
   title, GUID or handle (housekeeping: remove a stale same-titled object
   before publishing a new one with the same title).
 
@@ -46,12 +46,12 @@ thread (the form's object pickers) and the kernel's worker thread (cell
 code) both call it. The underlying ``QLocalSocket`` belongs to the thread
 that created the client (the GUI thread): calls from that thread run the
 transaction directly; calls from any other thread marshal the request to
-the owner thread through a queued Qt signal and wait in small slices —
+the owner thread through a queued Qt signal and wait in small slices --
 which is exactly where a kernel-worker ``KeyboardInterrupt`` (the Stop
 button's async interrupt) lands: it sends a ``cancel`` frame for the
 in-flight request and re-raises, and the service's next cancel checkpoint
 aborts the handler. While the owner thread waits for a response it pumps
-the application's OWN event loop — the notebook process is ORS-free, so
+the application's OWN event loop -- the notebook process is ORS-free, so
 that is safe (the round-6 hazard was pumping DRAGONFLY's loop during
 native ORS calls) and it is what delivers the Stop click and the queued
 cancel signal mid-call; the form's guards (toolbar and structural actions
@@ -60,10 +60,10 @@ Progress events of a running publish arrive as frames
 and are forwarded to ``progress_callback`` on the owner thread.
 
 Connection loss. A dfnb call raised while disconnected fails with a clear
-``RuntimeError``; the form polls :meth:`poll_reconnect` on a timer — it
+``RuntimeError``; the form polls :meth:`poll_reconnect` on a timer -- it
 retries the original pipe name first, then any ``dfnb_bridge_*`` pipe it
 can handshake with (with two Dragonfly instances running, the first bridge
-to answer wins — the notebook simply talks to that Dragonfly).
+to answer wins -- the notebook simply talks to that Dragonfly).
 """
 
 import os
@@ -71,9 +71,33 @@ import os
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'True')
 
 from . import notebook_bridge_protocol as protocol  # noqa: E402 (registers the DLL dirs before numpy loads)
-import numpy as np  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
+
+
+class _LazyNumpy:
+    """Round 16: numpy binds on the FIRST attribute touch, not at import
+    (the protocol module registers the Dragonfly DLL directories first,
+    and nothing here needs numpy until a call actually carries an
+    array; the custom-environment cells run in a SUBPROCESS on the
+    venv's own interpreter, so this process's one numpy copy stays the
+    embedded one). The first touch rebinds the module-global
+    ``np`` to the real module, so the indirection is paid once."""
+
+    def __getattr__(self, name):
+        import numpy
+        globals()['np'] = numpy
+        return getattr(numpy, name)
+
+
+np = _LazyNumpy()
+
+
+def reset_lazy_numpy():
+    """Re-arms the lazy-numpy proxy (the tier-1 suite pins the proxy's
+    contract through it: the next touch re-imports numpy instead of
+    holding whatever module object was bound before)."""
+    globals()['np'] = _LazyNumpy()
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal  # noqa: E402
 from PyQt6.QtNetwork import QLocalSocket  # noqa: E402
@@ -83,14 +107,14 @@ __all__ = ['DfnbClient', 'PublishedObject']
 _CANCEL_MESSAGE = 'Operation cancelled by user.'
 
 _DISCONNECT_MESSAGE = (
-    'The Dragonfly bridge is disconnected — Dragonfly may have been closed '
+    'The Dragonfly bridge is disconnected -- Dragonfly may have been closed '
     'or restarted. The notebook window reconnects automatically once the '
     'bridge is back; run the cell again then.')
 
 _NOT_AN_OBJECT_MESSAGE = (
     'dfnb runs in the notebook application, separate from Dragonfly: pass '
     "the object's title or GUID as a string, or a handle returned by a "
-    'dfnb publish — an ORS object itself cannot cross the bridge.')
+    'dfnb publish -- an ORS object itself cannot cross the bridge.')
 
 
 class PublishedObject(dict):
@@ -110,7 +134,7 @@ class PublishedObject(dict):
 
 
 # ---------------------------------------------------------------------------
-# validation helpers — same texts as dragonflynotebook_lib (user-facing
+# validation helpers -- same texts as dragonflynotebook_lib (user-facing
 # contracts); the data layer re-validates on its side
 # ---------------------------------------------------------------------------
 
@@ -148,7 +172,7 @@ def _pick_title(title, default_title):
 
 def _check_wipe(wipe):
     """The wipe flag is a STRICT bool: a truthy non-bool (1, 'true') is
-    refused the same fail-fast way as a bad timestep — a wipe replaces all
+    refused the same fail-fast way as a bad timestep -- a wipe replaces all
     existing properties, so it must never fire from an accidental truthy
     value."""
     if not isinstance(wipe, bool):
@@ -170,7 +194,7 @@ def _smallest_uint_type(max_value, what):
 
 def _conform_array_for_channel(array, what):
     """Same dtype/shape policy as the data layer; returns the array to
-    ship (the service conforms again — idempotent)."""
+    ship (the service conforms again -- idempotent)."""
     a = np.asarray(array)
     if a.ndim not in (2, 3):
         raise ValueError(
@@ -195,7 +219,7 @@ def _conform_array_for_channel(array, what):
     else:
         raise ValueError(
             f"{what} has unsupported dtype {dtype}. Use one of uint8, "
-            f"uint16, uint32, float32 — or anything the dfnb dtype policy "
+            f"uint16, uint32, float32 -- or anything the dfnb dtype policy "
             f"converts (bool, float16/64, signed ints, uint64).")
     return np.ascontiguousarray(out)
 

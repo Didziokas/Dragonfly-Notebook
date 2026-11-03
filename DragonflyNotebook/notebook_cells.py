@@ -405,7 +405,7 @@ class PythonCellHighlighter(QSyntaxHighlighter):
     # dark editor -- probed over numpy snippets, Token.Name (identifiers),
     # Token.Name.Namespace and above all Token.Punctuation (the brackets,
     # parens and commas -- the 'worst inside bracketed/parenthesized code
-    # segments' of the user's contrast report) were exactly that. The
+    # segments' from the round-8 contrast review) were exactly that. The
     # parent-chain resolution means Token.Name also covers Name.Namespace,
     # Name.Attribute, Name.Exception, ...; Token.Text covers the
     # whitespace tokens (no visible glyphs, styled for completeness).
