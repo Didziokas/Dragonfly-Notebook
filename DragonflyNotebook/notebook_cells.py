@@ -431,7 +431,15 @@ class PythonCellHighlighter(QSyntaxHighlighter):
 
     def __init__(self, document):
         super().__init__(document)
-        self._lexer = pygments.lexers.PythonLexer()
+        # stripnl=False is load-bearing: pygments' default strips every
+        # LEADING and trailing newline off the lexed text, so a cell whose
+        # source starts with blank lines shifts the per-block span map
+        # against the QTextDocument's real block numbers (every span lands
+        # k blocks high -- mis-colored until the blank line goes). With
+        # ensurenl=False the lexed line set equals the document's block set
+        # exactly, keeping the indices aligned.
+        self._lexer = pygments.lexers.PythonLexer(stripnl=False,
+                                                  ensurenl=False)
         self._formats = {}
         self._format_cache = {}
         for token_type, color, bold, italic in self._TOKEN_STYLES:

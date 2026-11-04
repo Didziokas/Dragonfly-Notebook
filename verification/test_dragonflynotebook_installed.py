@@ -59,7 +59,12 @@ plugin manager sees it (namespace package
       keeps a notebook whose stored outputs are list-typed and shows the
       stream text in the cell browser, and a renderer that RAISES cannot
       kill the window (the open falls back to a fresh empty notebook
-      behind exactly one user-facing failure entry);
+      behind exactly one user-facing failure entry); round 21 adds the
+      highlighter's block-alignment regression pin: a source STARTING
+      with blank lines (typed, pasted or loaded from a file) must still
+      color import/def/class correctly -- the pin reads the Qt-APPLIED
+      formats on the real document blocks, with and without the leading
+      newline, through both the edit path and the load path;
   (5) the picker dialogs headless, BRIDGE-FED: the object combos fill
       through ``dfnb.list_objects`` over the real pipe against real ORS
       fixtures, the measured-properties chooser through
@@ -78,8 +83,12 @@ plugin manager sees it (namespace package
       the editor's own vertical scrollbar maximum at 0 -- the layout's
       visual-line ground truth -- through the real form hooks too) and
       the output browsers' mirrored fit (a text output sizes its browser
-      to the document at vbar max 0, a 600x300 figure shows fully, a
-      40-line output caps at 400 px and scrolls by design), the
+      to the document at vbar max 0, a 600x300 figure shows fully; round
+      21: every output renders at its FULL content height past the
+      retired 400 px cap -- vertical scrollbar policy AlwaysOff, no
+      nested vertical scrolling; a wide image keeps its horizontal
+      scrollbar without vertical clipping, and a tall rendered markdown
+      cell takes its full content height too), the
       Qt-free .ipynb drop decision truth table, the cell editors'
       ignore-the-.ipynb-drag contract (no URL text inserted, snippet
       drags still accepted), the form-level drop (a valid local .ipynb
@@ -87,7 +96,19 @@ plugin manager sees it (namespace package
       notebook untouched, a mixed drag is refused), the drop-filter
       lifecycle (installed by the first plugin instance, idempotent,
       removed on demand) and the filter's own consume/pass event contract
-      with a monkeypatched launcher;
+      with a monkeypatched launcher; plus round 21's scroll
+      preservation: structural actions (delete, move, insert below,
+      append) keep the viewport on the current cell of a 25-cell
+      notebook with 40-line STORED OUTPUTS instead of jumping to the
+      top (the stored outputs above the current cell settle their
+      geometry over several zero-turns, so the deferred settle chains
+      BOUNDED passes while the layout is still moving or the frame is
+      out of view; the outputless first fixture and a visibility-only
+      retry both let a mid-cascade pass slip through), the full-height
+      fit's far safety valve (_MAX_FULL_HEIGHT,
+      engaged only past Qt's own widget limit: the height pins at the
+      ceiling and that browser flips to AsNeeded, every normal fit
+      stays AlwaysOff), and opening a notebook still lands at the top;
   (7) the spawned application, offscreen: a REAL second process --
       ``notebook_app.py`` from the installed tree against this suite's
       bridge -- driven through the app's documented DFNB_SMOKE hooks and
@@ -459,7 +480,8 @@ for name in ("notebook_progress_dialog.py", "functions_dock.py",
 # ---------------------------------------------------------------------------
 print("\n=== (2) the launcher mechanics ===", flush=True)
 
-from PyQt6.QtCore import QBuffer, QEvent, QEventLoop, QPoint, QPointF, QMimeData, Qt, QUrl  # noqa: E402
+from PyQt6.QtCore import (QBuffer, QEvent, QEventLoop, QPoint, QPointF,  # noqa: E402
+                          QRect, QMimeData, Qt, QUrl)
 from PyQt6.QtGui import (QDragEnterEvent, QDropEvent, QFontMetrics, QImage,  # noqa: E402
                          QKeyEvent, QMouseEvent)
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QFrame,
@@ -636,6 +658,92 @@ try:
            "the code cell editor carries a pygments highlighter")
     result(form._cell_widgets[0]["browser"].isHidden(),
            "the output area starts hidden (no outputs yet)")
+
+    # Round 21 highlighter regression: a source that STARTS with blank
+    # lines used to shift every token span against the document's real
+    # block numbers (pygments' default stripnl deletes leading AND
+    # trailing newlines before lexing, while the spans key on a block
+    # index counted from the lexed text) -- import/def/class rendered
+    # plain or with another line's color, and the wrong colors PERSISTED
+    # until the leading blank line went. The honest ground truth is the
+    # Qt-APPLIED format on the correct document block (block.layout()
+    # .formats() after the deferred relex has run), never the internal
+    # span map. The comment block is large so a one-block drift cannot
+    # pass by accident.
+    hl_source_body = '# leading explanation\n' * 60 + (
+        'import os\n\n'
+        'def compute(x):\n    return x + 1\n\n'
+        'class Foo:\n    def bar(self):\n        pass\n')
+
+    def _applied_color(editor, source, needle):
+        position = source.find(needle)
+        if position < 0:
+            return None
+        block_index = source.count('\n', 0, position)
+        block = editor.document().firstBlock()
+        index = 0
+        while block.isValid() and index < block_index:
+            block = block.next()
+            index += 1
+        if not block.isValid():
+            return None
+        offset = block.text().find(needle)
+        if offset < 0:
+            return None
+        for fragment in block.layout().formats():
+            if fragment.start <= offset < fragment.start + fragment.length:
+                return fragment.format.foreground().color().name()
+        return None
+
+    def _hl_result(label, editor, source):
+        failures = []
+        for needle, expected in (
+                ('import', '#c678dd'), ('def', '#c678dd'),
+                ('compute', '#61afef'), ('class', '#c678dd'),
+                ('Foo', '#e5c07b')):
+            got = _applied_color(editor, source, needle)
+            if got != expected:
+                failures.append('{!r}: want {}, got {}'.format(
+                    needle, expected, got))
+        result(not failures, label + ' ({})'.format(
+            '; '.join(failures) if failures else
+            'import/def purple, compute blue, class purple, Foo amber'))
+
+    # The edit path: a leading blank line typed at position 0 (one Enter
+    # at the top of the cell) -- the mis-colored case.
+    leading_source = '\n' + hl_source_body
+    form._cell_widgets[0]["editor"].setPlainText(leading_source)
+    app.processEvents()
+    app.processEvents()
+    _hl_result('a leading blank line does not shift the token colors '
+               '(edit path)',
+               form._cell_widgets[0]["editor"], leading_source)
+    # The control: the SAME content without the leading newline also
+    # colors correctly (proves the helper reads real applied formats,
+    # not a constant).
+    form._cell_widgets[0]["editor"].setPlainText(hl_source_body)
+    app.processEvents()
+    app.processEvents()
+    _hl_result('the same content without the blank line colors correctly '
+               '(control)',
+               form._cell_widgets[0]["editor"], hl_source_body)
+    form.document.is_dirty = False
+
+    # The load path: a saved .ipynb whose first code cell source begins
+    # with a newline must color correctly FROM OPEN (this used to render
+    # mis-colored deterministically, no edit needed).
+    hl_doc = installed_core.NotebookDocument.new_notebook()
+    hl_doc.set_cell_source(0, leading_source)
+    hl_path = os.path.join(temp_dir, "hl_leading_blank.ipynb")
+    hl_doc.save(hl_path)
+    form._load_notebook_document(hl_doc, hl_path)
+    app.processEvents()
+    app.processEvents()
+    result(form.document.cell_count() == 1,
+           "the highlighter load-path notebook opened with one cell")
+    _hl_result('a leading blank line does not shift the token colors '
+               '(loaded from a file)',
+               form._cell_widgets[0]["editor"], leading_source)
 
     # The toolbar carries the notebook command set (the round-8 tools row
     # is a SECOND row -- the snippet/picker buttons -- not a toolbar
@@ -2172,11 +2280,13 @@ try:
     # 256x192 no matter what it holds, so before round 9 a matplotlib
     # figure clipped to a ~50 px band and a multi-line text output
     # clipped mid-glyph. The honest ground truth is again the widget's
-    # own scrollbar arithmetic: under the cap the browser's
-    # verticalScrollBar().maximum() MUST be 0 (nothing clipped); at or
-    # over the cap it scrolls BY DESIGN (outputs keep their own
-    # scrollbar, the round-9 decision, so a giant array output cannot
-    # blow the panel up). The outputs ride the form's REAL paths -- the
+    # own scrollbar arithmetic: since round 21 the browser renders at
+    # its FULL content height -- the notebook renders like a document,
+    # the panel is the one vertical scroll area, nothing inside a cell
+    # scrolls vertically -- so verticalScrollBar().maximum() MUST be 0
+    # whatever the output's height, and the vertical scrollbar policy is
+    # AlwaysOff. Wide content keeps a horizontal scrollbar (policy
+    # AsNeeded). The outputs ride the form's REAL paths -- the
     # live streaming chunk (_append_live_html, what a running cell
     # grows) and the authoritative re-render (_render_outputs, what
     # run-finished writes) -- and the output area is restored to its
@@ -2185,6 +2295,12 @@ try:
     output_record = code_record
     output_index = form._cell_widgets.index(output_record)
     output_browser = output_record["browser"]
+    result(output_browser.verticalScrollBarPolicy()
+           == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+           and output_browser.horizontalScrollBarPolicy()
+           == Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+           "an output browser scrolls horizontally only (vertical policy "
+           "AlwaysOff, horizontal AsNeeded)")
     form._render_outputs(output_index, [])
     app.processEvents()
     form._running = True
@@ -2198,31 +2314,38 @@ try:
         form._running_cell_index = -1
     app.processEvents()
     output_doc = output_browser.document().size().height()
-    output_expected = min(int(math.ceil(output_doc))
-                          + installed_form._OUTPUT_HEIGHT_FUDGE,
-                          installed_form._MAX_OUTPUT_HEIGHT)
+    output_expected = int(math.ceil(output_doc)) \
+        + installed_form._OUTPUT_HEIGHT_FUDGE
     result(abs(output_browser.height() - output_expected) <= 4
            and output_browser.verticalScrollBar().maximum() == 0,
            "a 4-line text output sizes its browser to the document "
-           "(height {} ~ min({} + {} fudge, cap {}), vbar max {})".format(
+           "(height {} ~ {} + {} fudge, vbar max {})".format(
                output_browser.height(), int(math.ceil(output_doc)),
                installed_form._OUTPUT_HEIGHT_FUDGE,
-               installed_form._MAX_OUTPUT_HEIGHT,
                output_browser.verticalScrollBar().maximum()))
 
-    # The GIANT output: at 40 lines the laid-out document (~528 px) is
-    # past the cap, so the browser pins at 400 px and SCROLLS -- pinned
-    # as vbar max > 0 (it must NOT grow the cell to thousands of pixels).
+    # The TALL output: a 40-line stream output lays out to ~528 px, well
+    # past the 400 px cap round 21 retired, and the browser must take
+    # the FULL height (content plus the frame allowance) and show every
+    # line -- no internal vertical scrolling, the panel scrolls instead.
     form._render_outputs(output_index, [
         {"output_type": "stream", "name": "stdout",
          "text": "\n".join("line {} some output".format(i)
                            for i in range(40))}])
     app.processEvents()
-    result(output_browser.height() == installed_form._MAX_OUTPUT_HEIGHT
-           and output_browser.verticalScrollBar().maximum() > 0,
-           "a 40-line output caps its browser at {} px and scrolls by "
-           "design (height {}, vbar max {})".format(
-               installed_form._MAX_OUTPUT_HEIGHT, output_browser.height(),
+    tall_doc = output_browser.document().size().height()
+    result(output_browser.height()
+           == int(math.ceil(tall_doc))
+           + installed_form._OUTPUT_HEIGHT_FUDGE
+           and output_browser.height() > 400
+           and output_browser.verticalScrollBar().maximum() == 0
+           and output_browser.verticalScrollBarPolicy()
+           == Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+           "a 40-line output renders at its full content height "
+           "(browser {} = ceil({:.1f}) + {} fudge, past the retired "
+           "cap, vbar max {}, policy AlwaysOff)".format(
+               output_browser.height(), tall_doc,
+               installed_form._OUTPUT_HEIGHT_FUDGE,
                output_browser.verticalScrollBar().maximum()))
 
     # The FIGURE output (the visual-judge defect): a 600x300 PNG embedded
@@ -2248,6 +2371,69 @@ try:
            "-- the round-9 defect was a ~50 px clip band)".format(
                output_browser.height(),
                output_browser.verticalScrollBar().maximum()))
+
+    # The WIDE output, line case (round 21): a 220-character line WRAPS
+    # (the renderer emits pre-wrap), so no horizontal scrollbar is
+    # needed and the vertical scrollbar stays at 0 -- the bar is
+    # AVAILABLE (policy AsNeeded) for whatever genuinely overflows, and
+    # two consecutive fits settle on one height.
+    wide_line = "x" * 220
+    form._render_outputs(output_index, [
+        {"output_type": "stream", "name": "stdout",
+         "text": wide_line}])
+    app.processEvents()
+    wide_line_doc = output_browser.document().size().height()
+    form._fit_browser_to_content(output_browser)
+    wide_line_first = output_browser.height()
+    form._fit_browser_to_content(output_browser)
+    app.processEvents()
+    result(output_browser.height()
+           == int(math.ceil(wide_line_doc))
+           + installed_form._OUTPUT_HEIGHT_FUDGE
+           and output_browser.height() == wide_line_first
+           and output_browser.verticalScrollBar().maximum() == 0
+           and output_browser.horizontalScrollBarPolicy()
+           == Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+           "a 220-character line output wraps and does not clip (height "
+           "{} = ceil({:.1f}) + {} fudge, two fits one height, vbar max "
+           "{}, horizontal policy AsNeeded)".format(
+               output_browser.height(), wide_line_doc,
+               installed_form._OUTPUT_HEIGHT_FUDGE,
+               output_browser.verticalScrollBar().maximum()))
+
+    # The WIDE output, overflow case: a 1200x100 PNG is wider than the
+    # ~850 px viewport, so the horizontal scrollbar really comes up
+    # (maximum() > 0) and it eats one scrollbar-height of the viewport
+    # -- the fit must carry that extent or the image's last pixel row
+    # clips into a vertical scrollbar. The honest ground truths: vbar
+    # max 0 (nothing clipped), the bar really up, and the height at
+    # least content + fudge + the scrollbar's own extent.
+    wide_img = QImage(1200, 100, QImage.Format.Format_RGB32)
+    wide_img.fill(0xFF3A5F9E)
+    wide_buf = QBuffer()
+    wide_buf.open(QBuffer.OpenModeFlag.ReadWrite)
+    result(wide_img.save(wide_buf, "PNG"),
+           "the wide pin encoded its 1200x100 PNG")
+    wide_b64 = base64.b64encode(bytes(wide_buf.data())).decode("ascii")
+    wide_buf.close()
+    form._render_outputs(output_index, [
+        {"output_type": "display_data", "data": {"image/png": wide_b64},
+         "metadata": {}}])
+    app.processEvents()
+    wide_doc_h = output_browser.document().size().height()
+    hbar_extent = output_browser.horizontalScrollBar().sizeHint().height()
+    result(output_browser.horizontalScrollBar().maximum() > 0
+           and output_browser.verticalScrollBar().maximum() == 0
+           and output_browser.height() >= int(math.ceil(wide_doc_h))
+           + installed_form._OUTPUT_HEIGHT_FUDGE + hbar_extent,
+           "a viewport-wider-than-panel image keeps its horizontal "
+           "scrollbar WITHOUT vertical clipping (hbar max {}, vbar max "
+           "{}, height {} >= ceil({:.1f}) + {} fudge + {} hbar "
+           "extent)".format(
+               output_browser.horizontalScrollBar().maximum(),
+               output_browser.verticalScrollBar().maximum(),
+               output_browser.height(), wide_doc_h,
+               installed_form._OUTPUT_HEIGHT_FUDGE, hbar_extent))
 
     # Idempotence: two consecutive fits settle on the SAME fixed height
     # (an unchanged setFixedHeight must not re-enter the layout).
@@ -2459,6 +2645,208 @@ try:
                "a non-drag event passes through the filter untouched")
     finally:
         installed_glue._launch_notebook_for_path = real_launcher
+
+    # ------------------------------------------------------------------
+    # Round 21: the rendered markdown preview's full-height fit and the
+    # panel's scroll preservation across structural actions. The form at
+    # this point holds the dropped two-cell notebook (code + markdown)
+    # from the drop pins above; the tall markdown cell reuses it and the
+    # scroll repro grows it, and a fresh reload at the end restores the
+    # dropped shape (and pins the open-at-top contract).
+
+    # A tall RENDERED markdown cell takes its full content height too
+    # (the SAME browser the outputs use, the SAME fit): 45 headings lay
+    # out to ~950 px, far past the retired cap, and the browser must
+    # show every line -- no internal vertical scrolling, the panel
+    # scrolls instead. The render goes through the REAL user flow: the
+    # Edit flip puts the cell's id back into the EDIT set, the long
+    # source is typed into the editor, and _run_cell_at renders it (a
+    # markdown run never starts the kernel).
+    markdown_index = next(
+        i for i in range(form.document.cell_count())
+        if form.document.get_cell(i)["cell_type"] == "markdown")
+    markdown_cell = form.document.get_cell(markdown_index)
+    form._on_markdown_edit_button_clicked(markdown_index)
+    markdown_source = "\n".join(
+        "## Section {} -- a heading with some prose below it".format(i)
+        for i in range(45))
+    form._cell_widgets[markdown_index]["editor"].setPlainText(
+        markdown_source)
+    app.processEvents()
+    result(form._run_cell_at(markdown_index) is False,
+           "a markdown cell's run renders it instead of the kernel")
+    app.processEvents()
+    md_browser = form._cell_widgets[markdown_index]["browser"]
+    md_doc_h = md_browser.document().size().height()
+    result(md_browser.height()
+           == int(math.ceil(md_doc_h)) + installed_form._OUTPUT_HEIGHT_FUDGE
+           and md_browser.height() > 400
+           and md_browser.verticalScrollBar().maximum() == 0
+           and md_browser.verticalScrollBarPolicy()
+           == Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+           "a tall rendered markdown cell renders at its full content "
+           "height (browser {} = ceil({:.1f}) + {} fudge, past the "
+           "retired cap, vbar max {}, policy AlwaysOff)".format(
+               md_browser.height(), md_doc_h,
+               installed_form._OUTPUT_HEIGHT_FUDGE,
+               md_browser.verticalScrollBar().maximum()))
+    form._on_markdown_edit_button_clicked(markdown_index)
+    app.processEvents()
+    result(md_browser.isHidden()
+           and form._cell_widgets[markdown_index]["editor"].isVisible(),
+           "flipping a rendered markdown cell back to EDIT hides the "
+           "browser and shows the editor")
+
+    # The far safety valve (round 21): the full-height fit has no
+    # user-facing cap, but Qt itself refuses widgets taller than
+    # QWIDGETSIZE_MAX (16777215 px) -- past that setFixedHeight clamps
+    # while the vertical policy stays AlwaysOff and the bottom of the
+    # output is unreachable. The valve constant is SHRUNK to 1000 here
+    # to exercise the valve path itself: a ~100-line output whose fitted
+    # height exceeds the ceiling lands AT the ceiling and the browser's
+    # vertical policy flips to AsNeeded (the extreme output stays
+    # reachable), a second fit under the valve is idempotent, and with
+    # the constant restored a refit of a normal output is full-height
+    # again at AlwaysOff with vbar max 0.
+    real_max_full_height = installed_form._MAX_FULL_HEIGHT
+    try:
+        installed_form._MAX_FULL_HEIGHT = 1000
+        valve_source = "\n".join(
+            "## Valve section {} -- a heading with some prose below it"
+            .format(i) for i in range(100))
+        form._cell_widgets[markdown_index]["editor"].setPlainText(
+            valve_source)
+        app.processEvents()
+        form._run_cell_at(markdown_index)
+        app.processEvents()
+        valve_doc_h = md_browser.document().size().height()
+        result(md_browser.height() <= installed_form._MAX_FULL_HEIGHT
+               and int(math.ceil(valve_doc_h))
+               + installed_form._OUTPUT_HEIGHT_FUDGE > 1000
+               and md_browser.verticalScrollBarPolicy()
+               == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+               and md_browser.verticalScrollBar().maximum() > 0,
+               "the far valve pins the height at _MAX_FULL_HEIGHT and "
+               "flips that browser to AsNeeded (fitted {} vs ceiling "
+               "{}, browser {}, vbar max {})".format(
+                   int(math.ceil(valve_doc_h))
+                   + installed_form._OUTPUT_HEIGHT_FUDGE,
+                   installed_form._MAX_FULL_HEIGHT, md_browser.height(),
+                   md_browser.verticalScrollBar().maximum()))
+        fitted_under_valve = md_browser.height()
+        form._fit_browser_to_content(md_browser)
+        result(md_browser.height() == fitted_under_valve,
+               "the fit stays idempotent under the valve (two fits, one "
+               "height {})".format(md_browser.height()))
+    finally:
+        installed_form._MAX_FULL_HEIGHT = real_max_full_height
+    form._fit_browser_to_content(md_browser)
+    app.processEvents()
+    result(md_browser.height()
+           == int(math.ceil(md_browser.document().size().height()))
+           + installed_form._OUTPUT_HEIGHT_FUDGE
+           and md_browser.verticalScrollBarPolicy()
+           == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+           and md_browser.verticalScrollBar().maximum() == 0,
+           "with the constant restored the refit is full-height again "
+           "(browser {}, policy AlwaysOff, vbar max {})".format(
+               md_browser.height(),
+               md_browser.verticalScrollBar().maximum()))
+
+    # The scroll-preservation repro (round 21): a 25-cell notebook whose
+    # CODE CELLS CARRY 40-LINE STORED OUTPUTS -- recorded on the document
+    # BEFORE the rebuild, so they render through the real builder at
+    # _add_cell_widget time -- scrolled to ~60 percent, then a STRUCTURAL
+    # action. Before round 21 every action collapsed the scroll value
+    # to 0: the rebuild tears the widgets down (the scroll area's value
+    # falls to 0) and the synchronous _focus_cell ensure lands while the
+    # rebuilt heights are still unsettled, so the viewport ended at the
+    # top once the layout settled taller. The deferred settle re-ensures
+    # the current cell's frame after the layout has settled -- and with
+    # tall stored outputs ABOVE the current cell, the rebuilt layout
+    # keeps growing for several event-loop turns after that, so the
+    # settle must chain BOUNDED zero-timer passes while the geometry is
+    # still moving or the frame is out of view (the single-pass shape
+    # left the current frame ~1200 px below the viewport with current
+    # 15/23/24, stable across pumping). The first fixture's outputless
+    # cells let that slip through; these are the shapes that catch it.
+    scroll_bar = form.scrollArea.verticalScrollBar()
+
+    def _frame_in_viewport(index):
+        frame = form._cell_widgets[index]["frame"]
+        top_left = frame.mapTo(form.scrollArea.viewport(), QPoint(0, 0))
+        return form.scrollArea.viewport().rect().intersects(
+            QRect(top_left, frame.size()))
+
+    def _pump():
+        app.processEvents()
+        app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 50)
+
+    for _ in range(23):
+        form.document.add_cell("code")
+    for _index in range(form.document.cell_count()):
+        if form.document.get_cell(_index)["cell_type"] != "code":
+            continue
+        form.document.set_cell_source(
+            _index, "\n".join("y = {} * {}".format(_index, _j)
+                              for _j in range(12)))
+        form.document.record_execution(
+            _index, _index + 1,
+            [{"output_type": "stream", "name": "stdout",
+              "text": "\n".join("stored output line {} of cell {}"
+                                .format(_j, _index)
+                                for _j in range(40))}])
+    form._rebuild_cells()
+    _pump()
+    result(form.document.cell_count() == 25
+           and scroll_bar.maximum() > 0
+           and form._cell_widgets[2]["browser"].height() > 300,
+           "the scroll repro built its 25-cell notebook with 40-line "
+           "stored outputs rendered through the real builder (scroll "
+           "max {}, code cell 2's browser {} px)".format(
+               scroll_bar.maximum(),
+               form._cell_widgets[2]["browser"].height()))
+
+    def _scroll_repro(label, action, current):
+        scroll_bar.setValue(int(scroll_bar.maximum() * 0.6))
+        _pump()
+        before = scroll_bar.value()
+        form._set_current_cell(current)
+        action()
+        _pump()
+        after = scroll_bar.value()
+        index = form._current_cell_index
+        result(after > 0 and _frame_in_viewport(index),
+               "{} keeps the viewport on the current cell (scroll {} -> "
+               "{}, current {}, frame in viewport)".format(
+                   label, before, after, index))
+
+    _scroll_repro("deleting a visible middle cell",
+                  form.on_delete_cell, 15)
+    _scroll_repro("moving a cell up", form.on_move_cell_up, 23)
+    # 24 cells remain after the delete above, so the move-down current
+    # stays inside the range (22 swaps with 23).
+    _scroll_repro("moving a cell down", form.on_move_cell_down, 22)
+    _scroll_repro("inserting a cell below (the Alt+Enter insertion)",
+                  lambda: form._navigate_after_run(12, insert_after=True),
+                  12)
+    _scroll_repro("appending at the end (the Shift+Enter append)",
+                  lambda: form._navigate_after_run(
+                      form.document.cell_count() - 1, insert_after=False),
+                  form.document.cell_count() - 1)
+
+    # Opening a notebook still lands at the TOP: a load rebuilds with no
+    # focus index (cell 0) and the deferred settle must not move the
+    # viewport off it.
+    restored_doc = installed_core.NotebookDocument.new_notebook()
+    restored_doc.set_cell_source(0, "1 + 1")
+    restored_doc.add_cell("markdown", source="# dropped via argv")
+    form._load_notebook_document(restored_doc, dropped_path)
+    _pump()
+    result(scroll_bar.value() == 0 and form._current_cell_index == 0,
+           "opening a notebook still lands at the top (scroll {}, "
+           "current {})".format(scroll_bar.value(),
+                                form._current_cell_index))
 
     # ------------------------------------------------------------------
     print("\n=== (6) the spawned notebook application, offscreen ===", flush=True)

@@ -102,7 +102,8 @@ import shutil  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
 
-from PyQt6.QtCore import QEventLoop, QLocale, Qt, QTimer, pyqtSignal  # noqa: E402
+from PyQt6.QtCore import QEventLoop, QLocale, QPoint, Qt, QTimer, \
+    pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QKeySequence, QShortcut, QTextCursor, QValidator  # noqa: E402
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,  # noqa: E402
                              QDialogButtonBox, QDoubleSpinBox, QFileDialog,
@@ -157,14 +158,6 @@ _LIVE_TICK_MS = 100
 # cadence while it is up -- a near-free socket state read).
 _RECONNECT_INTERVAL_MS = 2000
 
-# The output browsers' height cap (round 9): an output browser grows to
-# its laid-out content (the editor's resizeToContent treatment, mirrored
-# in _fit_browser_to_content) but only UP TO this cap -- outputs keep
-# their own scrollbar BY DESIGN, so a giant array output cannot blow the
-# cell (and the notebook panel) out to thousands of pixels; past the cap
-# the browser scrolls instead of growing.
-_MAX_OUTPUT_HEIGHT = 400
-
 # The frame allowance on top of the laid-out document height: the
 # browser's frame chrome (the native style's frame plus the
 # QTextBrowser#cell_output stylesheet border) sits OUTSIDE
@@ -177,6 +170,24 @@ _MAX_OUTPUT_HEIGHT = 400
 # same sweep says 2; the vbar-max-0 arithmetic is the round-9 editor
 # pins').
 _OUTPUT_HEIGHT_FUDGE = 3
+
+# The far ceiling on the full-height fit (round 21): full rendering has
+# NO user-facing cap below it (a multi-megapixel figure or a ~880k-line
+# text dump still lays out whole); the valve exists only because Qt
+# itself refuses widgets taller than QWIDGETSIZE_MAX (16777215 px) --
+# past that, setFixedHeight silently clamps while the vertical policy
+# stays AlwaysOff and the bottom of the output becomes unreachable. The
+# ceiling sits below Qt's limit with headroom, and the fit flips THAT
+# browser's vertical policy to AsNeeded when it engages, so even the
+# extreme output stays scrollable and reachable.
+_MAX_FULL_HEIGHT = 15000000
+
+# The settle chain's retry budget (round 21): the deferred scroll settle
+# after a structural rebuild re-ensures the current cell on zero-timer
+# passes while the rebuilt layout is still moving (the stored-output
+# browsers and the editors settle over several event-loop turns) and
+# bounds the chain at this many retries -- no accumulation past it.
+_SETTLE_RETRY_PASSES = 12
 
 # The footer watermark (round 10, the h5 importer's convention): an
 # understated gray line pinned to the very bottom of the form, carrying
@@ -329,9 +340,11 @@ QLabel#watermark_label { color: #808080; font-size: 8pt; }
    the default OS scrollbar on the main panel was the one light element
    on the window. SCOPED on purpose (the round-4b house rule): child
    dialogs inherit ancestor stylesheets, so every scrollbar selector
-   names its surface -- the main cells panel (QScrollArea#mainScrollArea)
-   and the per-cell output browsers (QTextBrowser#cell_output, which KEEP
-   their own scrollbars; the code editors have none at all). An unscoped
+   names its surface -- the main cells panel (QScrollArea#mainScrollArea,
+   the one vertical scroll area) and the per-cell output browsers
+   (QTextBrowser#cell_output, which keep their own HORIZONTAL scrollbar
+   only -- the vertical policy is AlwaysOff, the browser renders at its
+   full content height; the code editors have none at all). An unscoped
    scrollbar rule here would restyle every dialog's lists too. --- */
 QScrollArea#mainScrollArea QScrollBar:horizontal,
 QTextBrowser#cell_output QScrollBar:horizontal {
@@ -382,23 +395,20 @@ QTextBrowser#cell_output QScrollBar::sub-page:horizontal
 {
       background: none;
 }
-QScrollArea#mainScrollArea QScrollBar:vertical,
-QTextBrowser#cell_output QScrollBar:vertical
+QScrollArea#mainScrollArea QScrollBar:vertical
 {
       background: QLinearGradient( x1: 0, y1: 0, x2: 1, y2: 0, stop: 0.0 #121212, stop: 0.2 #282828, stop: 1 #484848);
       width: 9px;
       margin: 16px 0 16px 0;
       border: 1px solid #222222;
 }
-QScrollArea#mainScrollArea QScrollBar::handle:vertical,
-QTextBrowser#cell_output QScrollBar::handle:vertical
+QScrollArea#mainScrollArea QScrollBar::handle:vertical
 {
       background: QLinearGradient( x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #606060, stop: 0.5 #606060, stop: 1 #606060);
       min-height: 20px;
       border-radius: 2px;
 }
-QScrollArea#mainScrollArea QScrollBar::add-line:vertical,
-QTextBrowser#cell_output QScrollBar::add-line:vertical
+QScrollArea#mainScrollArea QScrollBar::add-line:vertical
 {
       border: 1px solid #1b1b19;
       border-radius: 2px;
@@ -407,8 +417,7 @@ QTextBrowser#cell_output QScrollBar::add-line:vertical
       subcontrol-position: bottom;
       subcontrol-origin: margin;
 }
-QScrollArea#mainScrollArea QScrollBar::sub-line:vertical,
-QTextBrowser#cell_output QScrollBar::sub-line:vertical
+QScrollArea#mainScrollArea QScrollBar::sub-line:vertical
 {
       border: 1px solid #1b1b19;
       border-radius: 2px;
@@ -418,9 +427,7 @@ QTextBrowser#cell_output QScrollBar::sub-line:vertical
       subcontrol-origin: margin;
 }
 QScrollArea#mainScrollArea QScrollBar::up-arrow:vertical,
-QTextBrowser#cell_output QScrollBar::up-arrow:vertical,
-QScrollArea#mainScrollArea QScrollBar::down-arrow:vertical,
-QTextBrowser#cell_output QScrollBar::down-arrow:vertical
+QScrollArea#mainScrollArea QScrollBar::down-arrow:vertical
 {
       border: 1px solid black;
       width: 1px;
@@ -428,9 +435,7 @@ QTextBrowser#cell_output QScrollBar::down-arrow:vertical
       background: white;
 }
 QScrollArea#mainScrollArea QScrollBar::add-page:vertical,
-QTextBrowser#cell_output QScrollBar::add-page:vertical,
-QScrollArea#mainScrollArea QScrollBar::sub-page:vertical,
-QTextBrowser#cell_output QScrollBar::sub-page:vertical
+QScrollArea#mainScrollArea QScrollBar::sub-page:vertical
 {
       background: none;
 }
@@ -2125,6 +2130,65 @@ class DragonflyNotebookForm(QMainWindow):
             focus_index = 0 if self._cell_widgets else -1
         if 0 <= focus_index < len(self._cell_widgets):
             self._focus_cell(focus_index)
+            # Round 21: the synchronous ensure above runs while the
+            # rebuilt layout is still unsettled -- the editors take their
+            # real height one zero-timer later (resizeToContent) and the
+            # browsers on their first documentSizeChanged -- so it can
+            # land near the TOP once the layout settles taller. One
+            # deferred pass re-ensures the focused frame after that
+            # settle; the index is looked up at call time, so a stale
+            # call from a superseded rebuild no-ops when the index is
+            # gone (a rebuild resets it to -1 first).
+            QTimer.singleShot(0, self._settle_scroll_on_current_cell)
+
+    def _settle_scroll_on_current_cell(self, retries=_SETTLE_RETRY_PASSES):
+        """The deferred scroll settle after a structural rebuild (round
+        21): the viewport must show the CURRENT cell once the rebuilt
+        layout has settled, not fall back to the top. Reads
+        ``_current_cell_index`` at call time and no-ops when it is out
+        of range, so a deferred call left over from a rebuild that was
+        itself replaced cannot scroll to a wrong frame.
+
+        Self-chaining and bounded, gated on LAYOUT STABILITY: a rebuild
+        with stored outputs keeps growing for several event-loop turns
+        (each editor's resizeToContent lands on its own zero-timer, and
+        every stored-output browser re-fits on its documentSizeChanged
+        storms), and a single pass -- or a pass chained on visibility
+        alone -- can land MID-CASCADE: the frame reads visible, then
+        the growth above it pushes it out of the viewport (repro: 25
+        code cells with 40-line stored outputs, current 15/23/24, then
+        a delete or a move -- scroll 12426 -> 12048 with the frame
+        ~1200 px below a 561 px viewport, stable). So each pass
+        re-ensures the frame and chains ONE more zero-timer pass while
+        a retry remains AND (the geometry moved during the pass -- the
+        scroll value, the scroll maximum or the frame's mapped top-left
+        -- OR the frame is out of view: its mapped top-left outside the
+        viewport rect, a frame taller than the viewport counting as
+        visible once its top is inside). Steady state stops after the
+        first still pass, and the retry budget bounds the chain (no
+        accumulation). Opening a notebook still lands at the page top:
+        there the current cell is cell 0, whose top is inside the
+        viewport at scroll 0, the geometry does not move, so the chain
+        stops after one no-op pass."""
+        index = self._current_cell_index
+        if not (0 <= index < len(self._cell_widgets)):
+            return
+        frame = self._cell_widgets[index]['frame']
+        viewport = self.scrollArea.viewport()
+        bar = self.scrollArea.verticalScrollBar()
+        top_before = frame.mapTo(viewport, QPoint(0, 0))
+        scroll_before = bar.value()
+        maximum_before = bar.maximum()
+        self.scrollArea.ensureWidgetVisible(frame, 20, 20)
+        top_after = frame.mapTo(viewport, QPoint(0, 0))
+        moved = (top_after != top_before
+                 or bar.value() != scroll_before
+                 or bar.maximum() != maximum_before)
+        visible = viewport.rect().contains(top_after)
+        if retries > 0 and (moved or not visible):
+            QTimer.singleShot(
+                0, lambda _r=retries - 1:
+                    self._settle_scroll_on_current_cell(_r))
 
     def _add_cell_widget(self, index):
         cell = self.document.get_cell(index)
@@ -2191,8 +2255,18 @@ class DragonflyNotebookForm(QMainWindow):
         browser.setObjectName('cell_output')
         browser.setOpenExternalLinks(False)
         browser.setFont(code_font())
-        # The output browser grows with its content, up to the cap: the
-        # editor's documentSizeChanged seam, mirrored. Connected BEFORE
+        # The browser renders at its FULL content height (the fit below),
+        # the way a document does -- so it never scrolls vertically: the
+        # notebook panel is the one vertical scroll area, and a nested
+        # one here would fight it. Horizontal stays available (AsNeeded):
+        # a laid-out document wider than the viewport (a wide figure or
+        # table) brings the bar up.
+        browser.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        browser.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # The output browser grows with its content: the editor's
+        # documentSizeChanged seam, mirrored. Connected BEFORE
         # any setHtml/setMarkdown below, so every content change rides it
         # -- the build-time stored outputs, the markdown preview, and the
         # later live chunks (_append_live_html) and authoritative
@@ -2412,7 +2486,7 @@ class DragonflyNotebookForm(QMainWindow):
         editor.resizeToContent()
 
     def _fit_browser_to_content(self, browser):
-        """Grows an output browser with its content, up to the cap.
+        """Grows an output browser to its FULL content height.
 
         Round 9 -- the editor's resizeToContent treatment, mirrored for
         the per-cell output browser: QTextBrowser's sizeHint is a
@@ -2423,21 +2497,55 @@ class DragonflyNotebookForm(QMainWindow):
         height, images included (data-URL images enter the layout
         synchronously -- probed: 4 text lines -> 60.0 px, a 600x300
         figure -> 308.0 px). The fixed height is that document size plus
-        the frame allowance, CLAMPED to _MAX_OUTPUT_HEIGHT: outputs keep
-        their own scrollbar (the round-9 decision), so a giant output
-        caps at 400 px and scrolls instead of stretching the cell to
-        thousands of pixels. The documentSizeChanged seam in
-        _add_cell_widget (connected before any setHtml/setMarkdown)
-        routes every content change here -- the build-time stored
-        outputs, the live stream chunks, the authoritative re-render and
-        the markdown preview. A document does not lay out until the
-        widget is shown, and showing re-lays-out and fires the signal,
-        so the fit lands on the post-show truth with no explicit fit at
-        the show sites. Idempotent: an unchanged fixed height does not
-        re-enter the layout (probed: two consecutive fits, one height,
-        zero signal churn after settling)."""
-        height = min(int(math.ceil(browser.document().size().height()))
-                     + _OUTPUT_HEIGHT_FUDGE, _MAX_OUTPUT_HEIGHT)
+        the frame allowance. Round 21 drops the round-9 cap: the browser
+        renders at its full content height, the way a document does --
+        the notebook panel is the one vertical scroll area and a nested
+        one inside a cell would fight it, so no output scrolls vertically
+        however tall it is (the browser's vertical scrollbar policy is
+        AlwaysOff; horizontal stays AsNeeded). Full rendering has no
+        user-facing cap below ~880k text lines (a height of
+        16777215 px, Qt's QWIDGETSIZE_MAX): the ONE exception is Qt's
+        own widget limit -- past it setFixedHeight
+        silently clamps while the vertical policy stays AlwaysOff and
+        the bottom of the output becomes unreachable. The far valve
+        ``_MAX_FULL_HEIGHT`` (15000000 px, well below Qt's limit) never
+        engages on a realistic output: when the fitted height would
+        exceed it, the height is pinned at the ceiling AND that
+        browser's vertical policy flips to AsNeeded, so even the
+        extreme output stays scrollable and reachable; in every other
+        case the fit leaves the policy at AlwaysOff (the normal
+        contract: no nested vertical scrolling). A laid-out document
+        WIDER
+        than the viewport (a wide figure or table) brings the horizontal
+        scrollbar up and eats one scrollbar-height of the viewport, so
+        the fit adds that extent back -- without it the last pixel row
+        clips into a vertical scrollbar. The comparison reads the
+        laid-out geometry, so the fit itself never flips the bar on or
+        off (no feedback loop), and it is idempotent: an unchanged fixed
+        height does not re-enter the layout (probed: two consecutive
+        fits, one height, zero signal churn after settling). The
+        documentSizeChanged seam in _add_cell_widget (connected before
+        any setHtml/setMarkdown) routes every content change here -- the
+        build-time stored outputs, the live stream chunks, the
+        authoritative re-render and the markdown preview. A document
+        does not lay out until the widget is shown, and showing
+        re-lays-out and fires the signal, so the fit lands on the
+        post-show truth with no explicit fit at the show sites."""
+        height = int(math.ceil(browser.document().size().height())) \
+            + _OUTPUT_HEIGHT_FUDGE
+        if browser.document().size().width() > browser.viewport().width():
+            height += browser.horizontalScrollBar().sizeHint().height()
+        if height > _MAX_FULL_HEIGHT:
+            # The far valve: Qt itself would clamp the fixed height at
+            # QWIDGETSIZE_MAX while the vertical policy stays AlwaysOff,
+            # making the bottom unreachable -- pin the height at the
+            # ceiling and let THIS browser scroll vertically instead.
+            height = _MAX_FULL_HEIGHT
+            browser.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        else:
+            browser.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         browser.setFixedHeight(height)
 
     # ---------------------------------------------------------- snippets
