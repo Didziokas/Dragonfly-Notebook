@@ -2200,7 +2200,24 @@ class DragonflyNotebookForm(QMainWindow):
         browser.document().documentLayout().documentSizeChanged.connect(
             lambda _size, b=browser: self._fit_browser_to_content(b))
         if is_code:
-            stored_html = render_outputs_html(cell.get('outputs') or [])
+            try:
+                stored_html = render_outputs_html(cell.get('outputs') or [])
+            except Exception as exc:
+                # A foreign notebook's stored payload can break the
+                # renderer (nbformat tolerates payload shapes this code
+                # may never have seen). The cell must stay usable and the
+                # failure must stay visible: one log record, then a red
+                # note in the output browser -- built through the
+                # renderer's own escaping, from a stream dict that can
+                # never hit the failing path itself.
+                _log.exception(
+                    'Dragonfly Notebook: the stored outputs of code cell '
+                    '%d could not be rendered; showing a failure note '
+                    'instead.', index)
+                stored_html = render_outputs_html(
+                    [{'output_type': 'stream', 'name': 'stderr',
+                      'text': 'the stored outputs could not be displayed: '
+                              '{}: {}'.format(type(exc).__name__, exc)}])
             if stored_html:
                 browser.setHtml(stored_html)
             else:
@@ -3607,41 +3624,74 @@ class DragonflyNotebookForm(QMainWindow):
     def _load_notebook_document(self, document, path):
         """The shared tail of every open path (the dialog's and the
         drop/argv one): swaps the opened document in, remembers the
-        folder, rebuilds the cells, updates the title and reports."""
+        folder, rebuilds the cells, updates the title and reports.
+
+        The tail is guarded: an exception escaping this Qt slot is fatal
+        to the whole application (PyQt6 aborts on unhandled slot
+        exceptions), so a failure AFTER the document was read -- a stored
+        payload the rebuild cannot survive, a registry or environment
+        fault -- logs one record, reports through the ONE-failure-message
+        seam and falls back to a fresh empty notebook instead of taking
+        the window down."""
         self.document = document
         self.file_path = document.file_path
-        registry_save({'last_used_folder': os.path.dirname(path)})
-        # Round 11: a loaded document starts every markdown cell RENDERED --
-        # the EDIT set belongs to the previous document, clear it (hygiene
-        # against id collisions across notebooks).
-        self._markdown_edit_ids.clear()
-        # Round 16: the notebook remembers its environment; restore the
-        # selection. An environment that no longer exists falls back to
-        # the embedded Python with a LOG entry (never a modal box in the
-        # middle of an open; the user sees the fallback in the strip).
-        saved = document.metadata.get('dfnb_environment')
-        name = None
-        fallback_note = None
-        if isinstance(saved, str) and saved:
-            if saved in notebook_envs.list_environments(self._envs_root):
-                name = saved
-            else:
-                _log.info("Dragonfly Notebook: the environment '%s' saved "
-                          'in %s no longer exists; running on the '
-                          'embedded Python.', saved, os.path.basename(path))
-                fallback_note = ("The saved environment '{}' no longer "
-                                 'exists; running on the embedded '
-                                 'Python.'.format(saved))
-        self._apply_environment(name, mark_dirty=False)
-        self._rebuild_cells()
-        self._update_title()
-        self._set_status('Opened {} ({} cells) -- {}'.format(
-            os.path.basename(path), document.cell_count(),
-            self._kernel_status_text()))
-        if fallback_note is not None:
-            # the fallback is the LAST word on the strip: the opened-file
-            # status right above would otherwise bury it in the same line
-            self._set_status(fallback_note)
+        try:
+            registry_save({'last_used_folder': os.path.dirname(path)})
+            # Round 11: a loaded document starts every markdown cell RENDERED --
+            # the EDIT set belongs to the previous document, clear it (hygiene
+            # against id collisions across notebooks).
+            self._markdown_edit_ids.clear()
+            # Round 16: the notebook remembers its environment; restore the
+            # selection. An environment that no longer exists falls back to
+            # the embedded Python with a LOG entry (never a modal box in the
+            # middle of an open; the user sees the fallback in the strip).
+            saved = document.metadata.get('dfnb_environment')
+            name = None
+            fallback_note = None
+            if isinstance(saved, str) and saved:
+                if saved in notebook_envs.list_environments(self._envs_root):
+                    name = saved
+                else:
+                    _log.info("Dragonfly Notebook: the environment '%s' saved "
+                              'in %s no longer exists; running on the '
+                              'embedded Python.', saved, os.path.basename(path))
+                    fallback_note = ("The saved environment '{}' no longer "
+                                     'exists; running on the embedded '
+                                     'Python.'.format(saved))
+            self._apply_environment(name, mark_dirty=False)
+            self._rebuild_cells()
+            self._update_title()
+            self._set_status('Opened {} ({} cells) -- {}'.format(
+                os.path.basename(path), document.cell_count(),
+                self._kernel_status_text()))
+            if fallback_note is not None:
+                # the fallback is the LAST word on the strip: the opened-file
+                # status right above would otherwise bury it in the same line
+                self._set_status(fallback_note)
+        except Exception as exc:
+            _log.exception(
+                'Dragonfly Notebook: the open of %s failed after the '
+                'document was read; falling back to an empty notebook.',
+                os.path.basename(path))
+            _show_message(self, 'The notebook could not be opened:\n{}: {}'
+                          .format(type(exc).__name__, exc))
+            try:
+                self.document = NotebookDocument.new_notebook()
+                self.file_path = None
+                self._markdown_edit_ids.clear()
+                self._apply_environment(None, mark_dirty=False)
+                # title and status first: they stay truthful even if the
+                # rebuild below is the part that fails
+                self._update_title()
+                self._set_status('The notebook could not be opened -- '
+                                 + self._kernel_status_text())
+                self._rebuild_cells()
+            except Exception:
+                # even a catastrophic fallback must never raise into the
+                # slot: one log record, the process stays alive
+                _log.exception(
+                    'Dragonfly Notebook: the empty-notebook fallback after '
+                    'a failed open failed too.')
 
     def on_open_notebook(self):
         if not self._guard_idle():

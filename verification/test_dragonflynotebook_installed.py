@@ -50,7 +50,16 @@ plugin manager sees it (namespace package
       flat-chrome (no run button, no type label, no accent bar, no cell
       border or background -- the dfnb_rendered property's QSS rules), a
       frame click selects the rendered cell, and Shift+Enter advancing
-      onto one focuses its browser;
+      onto one focuses its browser; round 20 adds the nbformat multiline
+      text payloads (every text field may be a str or a LIST of str
+      lines, the foreign-notebook crash class that round closes): a list
+      stream text renders both lines, a list text/plain renders, a list
+      image/png embeds byte-exact (lines joined before the whitespace
+      strip), the real open chain (from_file + _load_notebook_document)
+      keeps a notebook whose stored outputs are list-typed and shows the
+      stream text in the cell browser, and a renderer that RAISES cannot
+      kill the window (the open falls back to a fresh empty notebook
+      behind exactly one user-facing failure entry);
   (5) the picker dialogs headless, BRIDGE-FED: the object combos fill
       through ``dfnb.list_objects`` over the real pipe against real ORS
       fixtures, the measured-properties chooser through
@@ -782,6 +791,38 @@ try:
     result("fallback" in corrupt_html and "data:image/png" not in corrupt_html,
            "a corrupt image payload falls back to the text/plain")
 
+    # Round 20, the nbformat multiline payloads: every text field may be a
+    # str OR a LIST of str lines (the multiline form Jupyter writes -- the
+    # foreign-notebook crash class this round closes). The renderer joins
+    # the lines and never raises on a payload shape.
+    list_stream_html = installed_cells.render_outputs_html([
+        {"output_type": "stream", "name": "stdout",
+         "text": ["hello\n", "world\n"]}])
+    result("hello" in list_stream_html and "world" in list_stream_html,
+           "a list-typed stream text renders both lines (the exact crash "
+           "shape: str methods on a list used to raise)")
+    list_plain_html = installed_cells.render_outputs_html([
+        {"output_type": "display_data",
+         "data": {"text/plain": ["plain one\n", "plain two\n"]},
+         "metadata": {}}])
+    result("plain one" in list_plain_html and "plain two" in list_plain_html,
+           "a list-typed text/plain renders its joined text")
+    tiny_png = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+                "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+    tiny_png_bytes = base64.b64decode(tiny_png)
+    list_png_html = installed_cells.render_outputs_html([
+        {"output_type": "display_data",
+         "data": {"image/png": [tiny_png[:40] + "\n", tiny_png[40:]],
+                  "text/plain": "<Figure>"},
+         "metadata": {}}])
+    png_match = re.search(r"data:image/png;base64,([A-Za-z0-9+/=]+)",
+                          list_png_html)
+    result(png_match is not None
+           and base64.b64decode(png_match.group(1)) == tiny_png_bytes,
+           "a list-typed image/png embeds byte-exact (the lines are joined "
+           "BEFORE the whitespace strip, so no bracket or quote survives "
+           "into the payload)")
+
     # The ORS object-drag payload parser (the console's 'guids' XML shape,
     # read with ast.literal_eval instead of eval): the cross-process OS
     # drag from Dragonfly's object panel into the notebook window still
@@ -1292,6 +1333,88 @@ try:
                .format(len(save_entries)))
     finally:
         form_logger.removeHandler(log_handler)
+
+    # Round 20, the real open chain on a foreign-shaped notebook: a raw
+    # nbformat 4.5 file whose stream output carries the LIST text form
+    # (the multiline spelling Jupyter writes -- the exact crash class
+    # this round closes) opens through the REAL chain,
+    # NotebookDocument.from_file + _load_notebook_document, exactly the
+    # section-9 construction, and the cell browser shows the stream text.
+    list_notebook_json = (
+        '{"cells": [{"cell_type": "code", "execution_count": 1, '
+        '"id": "liststream01", "metadata": {}, "outputs": [{"name": '
+        '"stdout", "output_type": "stream", "text": ["from ", '
+        '"the list form\\n"]}], "source": ["print(\'hi\')\\n"]}], '
+        '"metadata": {}, "nbformat": 4, "nbformat_minor": 5}')
+    list_path = os.path.join(temp_dir, "list_stream.ipynb")
+    with open(list_path, "w", encoding="utf-8") as handle:
+        handle.write(list_notebook_json)
+    list_document = installed_core.NotebookDocument.from_file(list_path)
+    result(list_document.cell_count() == 1,
+           "the list-payload notebook loads through the real reader")
+    form._load_notebook_document(list_document, list_path)
+    app.processEvents()
+    result(form.document is list_document and form.file_path == list_path,
+           "the open chain kept the list-payload document (no fallback)")
+    result(form.document.get_cell(0)["outputs"][0]["text"]
+           == ["from ", "the list form\n"],
+           "the stored outputs stay verbatim (the list form is not rewritten)")
+    result("from" in form._cell_widgets[0]["browser"].toPlainText()
+           and "the list form" in form._cell_widgets[0]["browser"].toPlainText(),
+           "the code cell's browser shows the list-typed stream text")
+
+    # Round 20, containment: even a renderer that RAISES cannot kill the
+    # window on the open path. The monkeypatch simulates any renderer
+    # fault; the open must fall back to a fresh empty notebook with
+    # exactly ONE user-facing failure entry (the _show_message convention
+    # -- under running_in_test a log record) and no escaping exception.
+    def _raising_render(_outputs):
+        raise RuntimeError('boom')
+
+    original_renderer = installed_form.render_outputs_html
+    log_handler_r20 = _RecordingLogHandler()
+    form_logger.addHandler(log_handler_r20)
+    try:
+        installed_form.render_outputs_html = _raising_render
+        contained_doc = installed_core.NotebookDocument.new_notebook()
+        contained_doc.set_cell_source(0, "1 + 1")
+        contained_doc.get_cell(0)["outputs"] = [
+            {"output_type": "stream", "name": "stdout", "text": "out\n"}]
+        contained_path = os.path.join(temp_dir, "contained.ipynb")
+        contained_doc.save(contained_path)
+        records_before_r20 = len(log_handler_r20.records)
+        contained_loaded = installed_core.NotebookDocument.from_file(
+            contained_path)
+        form._load_notebook_document(contained_loaded, contained_path)
+        entries_r20 = log_handler_r20.records[records_before_r20:]
+        result(form.document is not contained_loaded
+               and form.document.cell_count() == 1
+               and form.document.get_cell(0)["cell_type"] == "code"
+               and form.document.get_cell(0)["source"] == ""
+               and form.file_path is None,
+               "a renderer failure on the open path falls back to a fresh "
+               "empty notebook (one empty code cell, no file path)")
+        notices = [entry for entry in entries_r20
+                   if "could not be opened" in entry]
+        result(len(notices) == 1
+               and notices[0].startswith("Dragonfly Notebook:")
+               and "RuntimeError" in notices[0] and "boom" in notices[0],
+               "the fallback surfaced exactly ONE failure entry naming the "
+               "exception ({} entries on the logger, the guarded internal "
+               "records are not the user-facing failure)".format(
+                   len(entries_r20)))
+    finally:
+        installed_form.render_outputs_html = original_renderer
+        form_logger.removeHandler(log_handler_r20)
+    app.processEvents()
+
+    # The containment pins above left the form on the fallback document:
+    # restore the shared form to the section's openme notebook (the state
+    # the open-failure block's restore left it with) for the pins below.
+    form.document = installed_core.NotebookDocument.from_file(open_path)
+    form.file_path = open_path
+    form._rebuild_cells()
+    app.processEvents()
 
     # The floating window keeps sane width bounds with content inside.
     form.resize(900, 700)

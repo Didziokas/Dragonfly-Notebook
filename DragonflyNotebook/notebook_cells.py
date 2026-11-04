@@ -543,16 +543,33 @@ _CODE_STYLE = ('white-space: pre-wrap; font-family: monospace; '
                'font-size: 9pt; margin: 2px 0px;')
 
 
+def _as_text(value):
+    """nbformat text payloads are a str or a list of str lines (the
+    multiline form Jupyter writes). Joins lists; None -> ''. Anything
+    else falls back to str() so a foreign payload can never raise in
+    the renderer."""
+    if value is None:
+        return ''
+    if isinstance(value, (list, tuple)):
+        return ''.join(str(part) for part in value)
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
 def _wrap_code(text, color):
     return '<div style="{}; color: {};">{}</div>'.format(
-        _CODE_STYLE, color, html.escape(text or ''))
+        _CODE_STYLE, color, html.escape(_as_text(text) or ''))
 
 
 def _embed_png(payload):
     """A data URL for an image/png payload (base64 text; whitespace inside
     a base64 payload is tolerated by decoders but not by data URLs, so it
-    is stripped)."""
-    payload = ''.join(str(payload).split())
+    is stripped). nbformat payloads may be a LIST of base64 line strings
+    (the multiline form), so the lines are joined BEFORE the whitespace
+    strip -- joining through str() instead would bake the list's brackets
+    and quotes into the payload and corrupt it."""
+    payload = ''.join(_as_text(payload).split())
     try:
         base64.b64decode(payload, validate=False)
     except Exception:
@@ -590,7 +607,7 @@ def render_outputs_html(outputs):
                 if url is not None:
                     parts.append('<img src="{}">'.format(url))
                     continue
-            text = data.get('text/plain')
+            text = _as_text(data.get('text/plain'))
             if text:
                 parts.append(_wrap_code(text, '#D4D4D4'))
         elif output_type == 'error':

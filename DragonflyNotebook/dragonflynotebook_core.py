@@ -59,7 +59,7 @@ import uuid
 # it (mainform). The two processes never see each other's modules -- the
 # notebook application process imports no ORS glue -- so the version
 # lives here, in the one module both import, and can never drift.
-__version__ = '0.7.3'
+__version__ = '0.7.4'
 
 # Same multiple-OpenMP-runtime workaround as every module in this project:
 # this module itself imports no numpy, but it is the FIRST line of the core
