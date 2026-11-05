@@ -27,9 +27,11 @@ import base64
 import html
 import math
 
-from PyQt6.QtCore import QEvent, QObject, QSize, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import (QColor, QFont, QFontDatabase, QPainter,
-                         QSyntaxHighlighter, QTextCharFormat)
+from PyQt6.QtCore import QBuffer, QEvent, QObject, QSize, QTimer, Qt, \
+    pyqtSignal
+from PyQt6.QtGui import (QColor, QFont, QFontDatabase, QImageReader,
+                         QPainter, QSyntaxHighlighter, QTextCharFormat,
+                         QTextCursor, QTextImageFormat)
 from PyQt6.QtWidgets import QPlainTextEdit, QWidget
 from PyQt6.QtXml import QDomDocument
 
@@ -369,6 +371,215 @@ class _RenderedMarkdownKeyFilter(QObject):
                 self.skipForward.emit()
             return True
         return super().eventFilter(obj, event)
+
+
+class _BrowserViewportResizeFilter(QObject):
+    """Round 22: one shared filter for every cell widget's viewport --
+    the output browsers AND (since 22b) the editors, whose grow-with-
+    content height changes move the cell frames just the same --
+    installed by the form. A Resize on ANY watched viewport only ARMS
+    the form's single-shot debounce timer (the callback is
+    ``form._arm_browser_image_fit``): a window drag emits a resize
+    storm, and the debounce coalesces the whole drag into ONE
+    image-fit pass per window, run with the CURRENT viewport widths
+    (see ``fit_document_images``); for the scroll anchor it guarantees
+    the quiet pass lands only after the last geometry change. Every
+    other event -- and the Resize itself -- passes through untouched
+    (False: the viewport must still handle its own resizes). Modeled
+    on ``_RenderedMarkdownKeyFilter`` (a QObject filter installed on a
+    browser); this one is owned by the FORM (not per-widget-parented)
+    because a single instance watches every cell's viewport, and the
+    form outlives all of them."""
+
+    def __init__(self, arm_callback, parent=None):
+        super().__init__(parent)
+        self._arm_callback = arm_callback
+
+    def eventFilter(self, obj, event):  # noqa: ARG002 -- Qt's filter signature
+        if event.type() == QEvent.Type.Resize:
+            self._arm_callback()
+        return False
+
+
+# ---------------------------------------------------------------------------
+# round 22: uniform image fitting inside a browser document
+# ---------------------------------------------------------------------------
+
+# Intrinsic sizes, parsed from the image SOURCE and cached by the
+# fragment's format name: the laid-out fragment's charFormat() does NOT
+# carry the intrinsic geometry (probed round 22: width()/height() read
+# 0.0/0.0 for a freshly embedded data-URL image -- the size lives in the
+# layout's loaded resource, not the format), so the fit reads the truth
+# from where the image came from. data URLs (ANY image format, not just
+# PNG) are decoded and sized through QImageReader on the decoded bytes;
+# file paths go through QImageReader().size(). Unreadable names cache as
+# None and are skipped forever (a foreign resource can never crash the
+# fit). The cache is CAPPED (round 22 review): a notebook can reference
+# unboundedly many distinct data URLs over its life, and each entry is
+# only a decode away from being recomputed -- the OLDEST entry is
+# evicted past the limit.
+_IMAGE_INTRINSIC_CACHE = {}
+_IMAGE_INTRINSIC_CACHE_LIMIT = 32
+
+
+def _intrinsic_from_reader(name):
+    """The (width, height) QImageReader reports for a resource NAME (a
+    file path), or None when unreadable."""
+    try:
+        reader_size = QImageReader(name).size()
+        if reader_size.isValid() and reader_size.width() > 0 \
+                and reader_size.height() > 0:
+            return (reader_size.width(), reader_size.height())
+    except Exception:
+        pass
+    return None
+
+
+def _intrinsic_from_data_url(name):
+    """The (width, height) of a data: URL's decoded payload, sized
+    through QImageReader on the decoded bytes (auto-detected format --
+    probed round 22: both PNG and JPEG payloads read their true sizes).
+    None when the payload is missing, undecodable or unreadable."""
+    _header, separator, payload = name.partition(',')
+    if not separator:
+        return None
+    payload = ''.join(payload.split())
+    try:
+        raw = base64.b64decode(payload, validate=False)
+    except Exception:
+        return None  # a corrupt payload is skipped, never raised
+    if not raw:
+        return None
+    buffer = QBuffer()
+    buffer.setData(raw)
+    buffer.open(QBuffer.OpenModeFlag.ReadOnly)
+    try:
+        reader = QImageReader(buffer)
+        reader.setAutoDetectImageFormat(True)
+        size = reader.size()
+        if size.isValid() and size.width() > 0 and size.height() > 0:
+            return (size.width(), size.height())
+    except Exception:
+        return None
+    finally:
+        buffer.close()
+    return None
+
+
+def _intrinsic_image_size(name):
+    """The (width, height) INTRINSIC size of an image resource, or None
+    when it cannot be determined. Cached by the fragment name (the same
+    data URL or path repeats on every rebuild and every refit pass);
+    a hit refreshes the entry's recency, and the oldest entry is
+    evicted past ``_IMAGE_INTRINSIC_CACHE_LIMIT``."""
+    if name in _IMAGE_INTRINSIC_CACHE:
+        size = _IMAGE_INTRINSIC_CACHE.pop(name)
+        _IMAGE_INTRINSIC_CACHE[name] = size
+        return size
+    if name.startswith('data:'):
+        size = _intrinsic_from_data_url(name)
+        if size is None:
+            # Honest fallback: hand the raw name to QImageReader (it
+            # cannot read a data: URL, so this yields None -- the point
+            # is that the fallback path is the SAME code a file path
+            # takes, never a silent special case).
+            size = _intrinsic_from_reader(name)
+    elif name:
+        size = _intrinsic_from_reader(name)
+    else:
+        size = None
+    _IMAGE_INTRINSIC_CACHE[name] = size
+    if len(_IMAGE_INTRINSIC_CACHE) > _IMAGE_INTRINSIC_CACHE_LIMIT:
+        oldest = next(iter(_IMAGE_INTRINSIC_CACHE))
+        _IMAGE_INTRINSIC_CACHE.pop(oldest)
+    return size
+
+
+def fit_document_images(document, available_width):
+    """Scales every image in the document DOWN to ``available_width``
+    (uniformly, aspect preserved) and returns how many were resized.
+
+    Round 22, the generic figure-fitting rule: a matplotlib figure wider
+    than the browser viewport must never make a cell scroll horizontally
+    -- it is scaled to the available width instead. The walk collects the
+    image fragments FIRST (position, length, name, current size, intrinsic
+    size) and applies the new QTextImageFormat AFTER the walk (mutating
+    formats mid-iteration would relayout under the iterator).
+
+    Uniform scaling, NEVER upscaling: ``desired_w =
+    min(intrinsic_w, available_width)``, ``desired_h`` the proportional
+    round of it. The WIDTH-ONLY shortcut (letting Qt scale the height
+    from an unset height attribute) is NOT taken: probed, width-only
+    does scale proportionally while the height attribute stays unset,
+    but a later refit would then merge into a format whose height is
+    still whatever an earlier pass left -- the scaled height is written
+    EXPLICITLY alongside the width (probed: both attributes read back
+    exactly, P9), keeping every pass deterministic. Idempotent: an
+    image already at its desired size is skipped (no format write, no
+    relayout churn), so repeated passes over a settled document cost a
+    walk and nothing else."""
+    if available_width is None or available_width <= 1:
+        return 0
+    pending = []
+    block = document.firstBlock()
+    while block.isValid():
+        it = block.begin()
+        while not it.atEnd():
+            fragment = it.fragment()
+            if fragment.isValid():
+                char_format = fragment.charFormat()
+                if char_format.isImageFormat():
+                    image_format = char_format.toImageFormat()
+                    intrinsic = _intrinsic_image_size(image_format.name())
+                    if intrinsic is not None:
+                        pending.append((fragment.position(),
+                                        fragment.length(),
+                                        image_format.name(),
+                                        image_format.width(),
+                                        image_format.height(), intrinsic))
+            it += 1  # PyQt6's QTextBlock iterator has no next(); += 1 steps it
+        block = block.next()
+    if not pending:
+        return 0
+    changed = 0
+    cursor = QTextCursor(document)
+    for (position, length, name, current_w, current_h,
+         (intrinsic_w, intrinsic_h)) in pending:
+        desired_w = min(intrinsic_w, available_width)
+        desired_h = max(1, int(round(intrinsic_h * desired_w / intrinsic_w)))
+        if abs(current_w - desired_w) < 0.5 \
+                and abs(current_h - desired_h) < 0.5:
+            continue
+        scaled = QTextImageFormat()
+        scaled.setName(name)
+        scaled.setWidth(float(desired_w))
+        scaled.setHeight(float(desired_h))
+        cursor.setPosition(position)
+        cursor.setPosition(position + length, QTextCursor.MoveMode.KeepAnchor)
+        cursor.mergeCharFormat(scaled)
+        changed += 1
+    return changed
+
+
+def available_image_width(browser):
+    """The width an image may occupy in ``browser`` without overflowing
+    it: the viewport width minus the document margin on BOTH sides.
+    Probed round 22 (viewport 698, margin 4.0): an image at 690 leaves
+    ``horizontalScrollBar().maximum() == 0`` and a document width equal
+    to the viewport; one pixel MORE already raises the maximum. Returns
+    None when the browser is not USEFULLY laid out yet: a viewport of
+    0 or 1 px, or -- round 22 review -- a browser that is not VISIBLE
+    (a fresh parented, not-yet-shown browser reports a bogus ~98 px
+    viewport, and a build-time fit against it would bake ~90 px figures
+    that the debounced pass only undoes; the post-show relayout and
+    the resize-debounce pass re-fit then, so None here is what makes
+    the build-time call the no-op the docstrings always claimed)."""
+    if not browser.isVisible():
+        return None
+    width = browser.viewport().width()
+    margin = int(browser.document().documentMargin() or 0)
+    available = width - 2 * margin
+    return available if available > 1 else None
 
 
 def guids_from_ors_xml(payload):

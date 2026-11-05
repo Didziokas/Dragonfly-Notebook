@@ -122,8 +122,11 @@ from .dragonflynotebook_core import (SNIPPET_ORDER, SNIPPET_SPECS,  # noqa: E402
                                      sanitize_identifier)
 from .dragonflynotebook_core import __version__ as _PLUGIN_VERSION  # noqa: E402
 from .notebook_cells import (NotebookCellEditor, PythonCellHighlighter,  # noqa: E402
-                             _RenderedMarkdownKeyFilter, code_font,
-                             render_outputs_html, render_stream_chunk)
+                             _BrowserViewportResizeFilter,
+                             _RenderedMarkdownKeyFilter,
+                             available_image_width, code_font,
+                             fit_document_images, render_outputs_html,
+                             render_stream_chunk)
 from .notebook_drop_policy import ipynb_drop_decision  # noqa: E402
 from .notebook_kernel import NotebookKernel  # noqa: E402
 
@@ -181,6 +184,20 @@ _OUTPUT_HEIGHT_FUDGE = 3
 # browser's vertical policy to AsNeeded when it engages, so even the
 # extreme output stays scrollable and reachable.
 _MAX_FULL_HEIGHT = 15000000
+
+# Round 22: the debounce window for the image-fit pass. A window drag
+# emits a viewport resize storm; every resize ARMS this single-shot
+# timer (the _BrowserViewportResizeFilter), so the whole drag coalesces
+# into ONE full pass over every cell browser with the CURRENT viewport
+# widths -- no per-pixel re-render. 140 ms is short enough that a
+# settle feels immediate, long enough to swallow the storm.
+_IMAGE_FIT_DEBOUNCE_MS = 140
+
+# Round 22b: the cap on the scroll anchor's repeated ensures (the
+# round-21 retry-budget pattern): the anchor re-ensures at each quiet
+# pass until one confirms the geometry stable, at most this many times,
+# so a pathological layout cannot pin the view forever.
+_IMAGE_FIT_ANCHOR_MAX_ENSURES = 4
 
 # The settle chain's retry budget (round 21): the deferred scroll settle
 # after a structural rebuild re-ensures the current cell on zero-timer
@@ -1760,6 +1777,60 @@ class DragonflyNotebookForm(QMainWindow):
         self._wire_kernel_signals()
 
         self._cell_widgets = []          # per-index records, see _add_cell_widget
+        # Round 22: ONE single-shot debounce timer and ONE shared resize
+        # filter for every cell widget's viewport (output browsers AND
+        # editors -- an editor's grow-with-content height change moves
+        # the frames just the same, so it must delay the anchor's quiet
+        # pass too). A viewport resize (a window drag, a panel reflow)
+        # only ARMS the timer; when it fires, _fit_all_browser_images
+        # re-runs the uniform image fit over every cell browser with the
+        # CURRENT viewport widths (markdown browsers included), so
+        # figures larger than the window are rescaled after every window
+        # resize.
+        self._browser_image_fit_timer = QTimer(self)
+        self._browser_image_fit_timer.setSingleShot(True)
+        self._browser_image_fit_timer.setInterval(_IMAGE_FIT_DEBOUNCE_MS)
+        self._browser_image_fit_timer.timeout.connect(
+            self._fit_all_browser_images)
+        self._browser_resize_filter = _BrowserViewportResizeFilter(
+            self._arm_browser_image_fit, parent=self)
+        # Round 22b: the scroll-anchor state machine, see
+        # _fit_all_browser_images. 0 = idle; 1 = armed by a structural
+        # rebuild (the ensure waits for the first image-changing pass);
+        # 2 = active (each quiet pass repairs or confirms; the anchor
+        # retires after two consecutive stable quiet passes). The
+        # counter bounds the repetitions.
+        self._image_fit_anchor_state = 0
+        self._image_fit_anchor_ensures = 0
+        # Round 22b: whether the current frame was in view at the last
+        # KNOWN scroll position. The scrollbar's user-action hooks
+        # (actionTriggered/sliderMoved) refresh
+        # it on every real scroll (the user's, or the round-21 settle's);
+        # content drift never fires that signal, so a quiet pass that
+        # finds the frame out of view with this still True knows the
+        # layout moved under a still viewport (repairable) -- while
+        # False means the user scrolled away (never yanked); see
+        # _fit_all_browser_images and _update_image_fit_anchor_in_view.
+        self._image_fit_anchor_in_view = False
+        # Round 22b: consecutive stable quiet passes before the anchor
+        # retires (one is not enough -- probed storm lulls exceed the
+        # debounce, so a single stable pass can still be mid-storm).
+        self._image_fit_anchor_stable_streak = 0
+        # Round 22b: whether ANY arm since the last pass saw the current
+        # frame in view. The pass-time visibility is too late -- a
+        # resize's first image wave can push the frame out during the
+        # 140 ms before the debounced pass, and gating the promotion on
+        # the pass-time position would then skip the repair entirely.
+        # The arm-time position is where the user had the cell when the
+        # geometry event arrived.
+        self._image_fit_anchor_saw_visible = False
+        # Round 22b: nesting counter around the form's OWN scroll
+        # repositioning (the round-21 settle chain, focus, the anchor's
+        # ensure). A scrollbar move made under this flag is not a user
+        # decision -- the settle can pass through positions where the
+        # current frame is out of view on the way to it -- so it must
+        # never revoke the anchor's recorded visibility.
+        self._anchor_internal_scroll = 0
         self._current_cell_index = -1    # the editor that last had focus
         self._running = False            # a cell (or Run All) is executing
         self._rebuilding = False         # suppresses spurious dirty flags
@@ -1888,6 +1959,17 @@ class DragonflyNotebookForm(QMainWindow):
         self.cellsLayout.addWidget(end_row)
         self.scrollArea.setWidget(self.cellsContainer)
         outerLayout.addWidget(self.scrollArea, 1)
+        # Round 22b: the anchor's user-scroll boundary. actionTriggered
+        # and sliderMoved fire ONLY for user-driven scrollbar input
+        # (wheel, drag, keys) -- programmatic setValue never does, so
+        # Qt's own clamp (a shrunken maximum pulling the value down
+        # after the image rescale) and the form's own repositioning
+        # cannot masquerade as the user scrolling away; see
+        # _update_image_fit_anchor_in_view.
+        self.scrollArea.verticalScrollBar().actionTriggered.connect(
+            self._update_image_fit_anchor_in_view)
+        self.scrollArea.verticalScrollBar().sliderMoved.connect(
+            self._update_image_fit_anchor_in_view)
 
         self.status_label = QLabel(self)
         self.status_label.setObjectName('status_label')
@@ -2125,6 +2207,21 @@ class DragonflyNotebookForm(QMainWindow):
                 self._add_cell_widget(index)
         finally:
             self._rebuilding = False
+            # Round 22b: every structural rebuild ARMS the image pass's
+            # scroll anchor (state 1). The rebuilt documents lay out on
+            # SHOW -- after this flag is back to False -- so the
+            # documentSizeChanged seam cannot observe the rebuild; and
+            # the round-21 contract says the post-rebuild viewport
+            # belongs to the current cell regardless. State 1 is not
+            # yet ready to ensure: the anchor engages only once a pass
+            # actually CHANGES an image (a text-only rebuild has
+            # nothing for the image pass to repair -- the round-21
+            # settle owns it, and consuming the flag early would let
+            # the ensure fire in a mid-storm lull BEFORE the figures
+            # are ever rescaled, probed). State 1 also downgrades to 0
+            # at a quiet pass with no images changed (the rebuild is
+            # over, the settle's own contract held).
+            self._image_fit_anchor_state = 1
         self._refresh_cell_accent()
         if focus_index is None:
             focus_index = 0 if self._cell_widgets else -1
@@ -2179,7 +2276,11 @@ class DragonflyNotebookForm(QMainWindow):
         top_before = frame.mapTo(viewport, QPoint(0, 0))
         scroll_before = bar.value()
         maximum_before = bar.maximum()
-        self.scrollArea.ensureWidgetVisible(frame, 20, 20)
+        self._anchor_internal_scroll += 1
+        try:
+            self.scrollArea.ensureWidgetVisible(frame, 20, 20)
+        finally:
+            self._anchor_internal_scroll -= 1
         top_after = frame.mapTo(viewport, QPoint(0, 0))
         moved = (top_after != top_before
                  or bar.value() != scroll_before
@@ -2240,6 +2341,11 @@ class DragonflyNotebookForm(QMainWindow):
         # the generated line at THIS editor's cursor.
         editor.snippetDropped.connect(
             lambda kind, ed=editor: self._on_snippet_dropped(ed, kind))
+        # Round 22b: the editor's viewport resizes (its grow-with-content
+        # height changes) arm the image-fit debounce too -- an editor
+        # height change moves the cell frames just the same, so it must
+        # delay the anchor's quiet pass the same way a browser's does.
+        editor.viewport().installEventFilter(self._browser_resize_filter)
         highlighter = None
         if is_code:
             highlighter = PythonCellHighlighter(editor.document())
@@ -2258,21 +2364,34 @@ class DragonflyNotebookForm(QMainWindow):
         # The browser renders at its FULL content height (the fit below),
         # the way a document does -- so it never scrolls vertically: the
         # notebook panel is the one vertical scroll area, and a nested
-        # one here would fight it. Horizontal stays available (AsNeeded):
-        # a laid-out document wider than the viewport (a wide figure or
-        # table) brings the bar up.
+        # one here would fight it. Round 22: horizontal scrolling is gone
+        # too (both policies AlwaysOff) -- a figure larger than the
+        # viewport is SCALED DOWN to fit instead of scrolling (the
+        # round-22 image fit below and at every content path); a browser
+        # never scrolls in either direction. The cell's SOURCE EDITOR is
+        # untouched by all of this: code editing wraps its lines (round
+        # 9's WidgetWidth + AlwaysOff pair) and stays exactly as it is --
+        # this round only changes how a cell's RENDERINGS behave.
         browser.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         browser.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Round 22: the viewport resize filter -- one form-owned
+        # instance shared by every cell browser -- arms the image-fit
+        # debounce whenever this viewport changes size, so a window drag
+        # re-scales the figures once per debounce window.
+        browser.viewport().installEventFilter(self._browser_resize_filter)
         # The output browser grows with its content: the editor's
         # documentSizeChanged seam, mirrored. Connected BEFORE
         # any setHtml/setMarkdown below, so every content change rides it
         # -- the build-time stored outputs, the markdown preview, and the
         # later live chunks (_append_live_html) and authoritative
-        # re-renders (_render_outputs) alike.
+        # re-renders (_render_outputs) alike. Round 22: the same seam
+        # also arms the image-fit debounce, so content that arrives
+        # BEFORE the widget is laid out (or resized) is still caught by
+        # the coalesced pass on the first real layout.
         browser.document().documentLayout().documentSizeChanged.connect(
-            lambda _size, b=browser: self._fit_browser_to_content(b))
+            lambda _size, b=browser: self._on_browser_size_changed(b))
         if is_code:
             try:
                 stored_html = render_outputs_html(cell.get('outputs') or [])
@@ -2294,10 +2413,23 @@ class DragonflyNotebookForm(QMainWindow):
                               '{}: {}'.format(type(exc).__name__, exc)}])
             if stored_html:
                 browser.setHtml(stored_html)
+                # Round 22: the stored outputs' figures are scaled to the
+                # available width at build time too -- a true no-op here
+                # (the browser is not visible yet; the round-22-review
+                # guard in available_image_width skips a pre-show bake
+                # against the bogus ~98 px viewport) and the post-show
+                # pass re-fits at the real width.
+                self._fit_browser_images_to_width(browser)
             else:
                 browser.hide()
         else:
             browser.setMarkdown(cell['source'])
+            # Round 22: a markdown cell's embedded images (local paths or
+            # data URLs) get the same uniform width fit as the outputs --
+            # a no-op here (the browser is not visible yet, the guard
+            # skips a pre-show bake), the post-show pass re-fits at the
+            # real width.
+            self._fit_browser_images_to_width(browser)
             # Round 11: the markdown cell's mode comes from the id-keyed
             # set -- a freshly added cell (its id joined the set before
             # this build) opens EDIT, a loaded one opens RENDERED (Jupyter
@@ -2447,7 +2579,11 @@ class DragonflyNotebookForm(QMainWindow):
             record['browser'].setFocus()
         else:
             record['editor'].setFocus()
-        self.scrollArea.ensureWidgetVisible(record['frame'], 20, 20)
+        self._anchor_internal_scroll += 1
+        try:
+            self.scrollArea.ensureWidgetVisible(record['frame'], 20, 20)
+        finally:
+            self._anchor_internal_scroll -= 1
 
     def _on_frame_clicked(self, index):
         """A press on a cell's frame made it the current cell (round 12).
@@ -2485,6 +2621,286 @@ class DragonflyNotebookForm(QMainWindow):
     def _on_editor_size_changed(self, editor):
         editor.resizeToContent()
 
+    def _on_browser_size_changed(self, browser):
+        """The output browser's documentSizeChanged seam (round 9), and
+        since round 22 also the arm point for the image-fit debounce:
+        every content change (build-time render, live chunk, authoritative
+        re-render, markdown preview) re-fits the height immediately and
+        coalesces an image-fit pass behind the debounce timer. The
+        scroll anchor itself is armed by the structural rebuilds (see
+        _rebuild_cells) and by the passes that change a visible cell's
+        images (see _fit_all_browser_images)."""
+        self._fit_browser_to_content(browser)
+        self._arm_browser_image_fit()
+
+    def _arm_browser_image_fit(self):
+        """Starts (restarts) the ONE single-shot debounce behind the
+        image-fit pass: viewport resizes and content changes both land
+        here, and only the QUIET window after the last arm runs the
+        pass -- a window drag coalesces into one re-scale. Each arm
+        also records whether the CURRENT frame was in view at that
+        moment (the resize filter fires before the layout reacts, so
+        this is where the user had the cell), consumed by the pass's
+        promotion decision; see _fit_all_browser_images."""
+        if self._current_frame_in_view():
+            self._image_fit_anchor_saw_visible = True
+        self._browser_image_fit_timer.start()
+
+    def _current_frame_in_view(self):
+        """Whether the CURRENT cell's frame intersects the panel
+        viewport (top-left inside; a frame taller than the viewport
+        counts as visible once its top is inside). Shared by the arm
+        hook, the user-action hook and the debounced pass."""
+        index = self._current_cell_index
+        if not 0 <= index < len(self._cell_widgets):
+            return False
+        viewport = self.scrollArea.viewport()
+        frame = self._cell_widgets[index]['frame']
+        return viewport.rect().contains(frame.mapTo(viewport, QPoint(0, 0)))
+
+    def _fit_browser_images_to_width(self, browser):
+        """Scales the too-wide images of ONE cell browser to its current
+        available width (round 22). The guard skips a not-usefully-laid-
+        out browser (a viewport of 0 or 1 px, or -- round 22 review --
+        a not-VISIBLE browser, whose fresh viewport reports a bogus
+        ~98 px: a pre-show build-time call) -- the first real layout
+        fires the documentSizeChanged seam, which arms the debounce,
+        and the coalesced pass fits then. Returns True when any image
+        format actually changed (the debounced pass uses that to decide
+        whether its scroll anchor is needed)."""
+        available = available_image_width(browser)
+        if available is None:
+            return False
+        return bool(fit_document_images(browser.document(), available))
+
+    def _fit_all_browser_images(self):
+        """The debounced pass: re-runs the uniform image fit over EVERY
+        cell browser (markdown cells included) with the CURRENT viewport
+        widths. Idempotent by construction (unchanged images are
+        skipped), so a pass over a settled notebook costs one walk per
+        document and no layout churn.
+
+        Round 22b, the scroll anchor: a window resize shrinks the
+        figures ABOVE the current cell too, and the resulting height
+        changes move the current frame inside the panel without moving
+        the scroll value -- the round-21 contract (structural actions
+        keep the viewport on the current cell) would silently break for
+        the most common real case (stored matplotlib outputs). The
+        anchor is a THREE-STATE machine (``_image_fit_anchor_state``):
+        0 idle, 1 armed-by-rebuild, 2 active.
+
+          * a pass that CHANGED an image promotes state 1 to 2 (the
+            rebuild's figures were rescaled -- the viewport must be
+            handed back to the current cell) and promotes 0 to 2 only
+            when an arm since the last pass saw the frame in view (the
+            user-resize case -- recorded at ARM time, because a resize's
+            first wave can push the frame out during the 140 ms before
+            the pass runs); either promotion records the current frame
+            as in-view, because a rebuild's own settle is contractually
+            landing on this cell and a resize promotion just saw it in
+            view;
+          * a QUIET pass (nothing changed) with state 2 runs
+            ``_ensure_current_cell_visible`` (the round-21 margins).
+            The frame is repaired when it is in view, or when it is out
+            of view but the last KNOWN scroll position had it in view
+            (content drift moved it out; the scrollbar never fired, so
+            nobody scrolled). When it is out of view AND the recorded
+            visibility is False, a real scroll put it there -- the
+            user's decision -- and the anchor retires WITHOUT
+            ensuring: a window drag must never yank the view.
+
+        Why the ensure REPEATS instead of firing once (probed, 22b
+        traces): in a freshly rebuilt figure-heavy layout the browsers'
+        height fits AND the editors' grow-with-content passes keep
+        landing over the following event-loop turns -- a data-URL
+        figure decodes over several turns, and the storm's waves come
+        in BURSTS separated by pauses LONGER than the 140 ms debounce.
+        A single fixed ensure lands mid-storm: either immediately (a
+        zero-timer, the frame drifts out afterwards) or in a lull where
+        the frame is momentarily visible (the probed failing runs: a
+        no-op ensure at scroll 3106 while the image pass and the next
+        wave then moved the frame out, with the anchor already
+        consumed). Even ONE stable quiet pass is not enough -- the
+        lulls are exactly what fires it early -- so the anchor retires
+        only after TWO consecutive STABLE quiet passes (each 140 ms
+        past the last geometry change), re-arming itself between them;
+        ``_IMAGE_FIT_ANCHOR_MAX_ENSURES`` caps the repairs (the
+        round-21 retry-budget pattern) so a pathological layout cannot
+        pin the view forever. Every repetition is the same single
+        ``ensureWidgetVisible`` the round-21 settle uses; nothing new
+        is scrolled when the layout is already right.
+
+        The no-yank rule rests on ``_update_image_fit_anchor_in_view``:
+        the scrollbar's actionTriggered/sliderMoved fire ONLY for
+        user-driven input -- programmatic setValue (Qt's own clamp after
+        a shrunken maximum, the form's own repositioning under
+        ``_anchor_internal_scroll``) never does, and content drift fires
+        nothing -- the exact boundary between 'the layout moved under a
+        still viewport' (repairable) and 'the user scrolled away' (a
+        user decision, never yanked)."""
+        index = self._current_cell_index
+        changed = False
+        for record in self._cell_widgets:
+            browser = record['browser']
+            available = available_image_width(browser)
+            if available is None:
+                continue
+            # The per-pass memo (round 22 review): a browser whose
+            # document revision AND available width are unchanged since
+            # its last fit needs no walk at all -- repeat passes and
+            # anchor re-arms cost near zero on a text-only (or settled)
+            # notebook, which is what keeps a 2000-cell load from paying
+            # a full-document walk per pass. The width half carries a
+            # 2 px threshold: sub-3-px viewport jitter (a scrollbar
+            # margin rounding, a font-metric edge) must not re-fit.
+            # BOUNDARY CASE, honestly unproven: a sustained oscillation
+            # would need the total content height to sit within one
+            # scrollbar-toggle's height delta so the panel scrollbar
+            # keeps appearing and disappearing and the viewport width
+            # keeps flipping past the threshold -- the 140 ms debounce
+            # and this memo both damp it, but no pin demonstrates the
+            # toggle cannot self-sustain.
+            revision = browser.document().revision()
+            memo = record.get('_image_fit_memo')
+            if memo is not None and memo[0] == revision \
+                    and abs(available - memo[1]) <= 2:
+                continue
+            if self._fit_browser_images_to_width(browser):
+                changed = True
+            # Store the POST-fit revision (probed: mergeCharFormat does
+            # not bump it, so a settled image document stays memoized)
+            # and the width the fit was APPLIED at -- a threshold-skipped
+            # pass must not widen the memo's window a pixel at a time.
+            record['_image_fit_memo'] = (browser.document().revision(),
+                                         available)
+        saw_visible = self._image_fit_anchor_saw_visible
+        self._image_fit_anchor_saw_visible = False
+        if changed:
+            # Geometry is moving again: prior stability proves nothing.
+            self._image_fit_anchor_stable_streak = 0
+            if self._image_fit_anchor_state == 1 or (
+                    saw_visible
+                    and self._image_fit_anchor_state == 0):
+                self._image_fit_anchor_state = 2
+                self._image_fit_anchor_ensures = 0
+                self._image_fit_anchor_stable_streak = 0
+                # A rebuild's own settle is contractually landing on
+                # this cell and a resize promotion just saw it in view:
+                # either way the last known scroll position had it in
+                # view. Only a later user action (a real scroll) may
+                # revoke that.
+                self._image_fit_anchor_in_view = True
+        elif self._image_fit_anchor_state == 2:
+            if not (0 <= index < len(self._cell_widgets)):
+                self._image_fit_anchor_state = 0
+            else:
+                # The quiet pass: the layout held still for a full
+                # debounce window -- repair (or confirm) the viewport.
+                bar = self.scrollArea.verticalScrollBar()
+                frame = self._cell_widgets[index]['frame']
+                viewport = self.scrollArea.viewport()
+                in_view = viewport.rect().contains(
+                    frame.mapTo(viewport, QPoint(0, 0)))
+                if not in_view and not self._image_fit_anchor_in_view:
+                    # A real scroll (the user's decision) took the
+                    # current cell away: retire, never yank it back.
+                    self._image_fit_anchor_state = 0
+                else:
+                    top_before = frame.mapTo(viewport, QPoint(0, 0)).y()
+                    scroll_before = bar.value()
+                    self._ensure_current_cell_visible()
+                    self._image_fit_anchor_ensures += 1
+                    top_after = frame.mapTo(viewport, QPoint(0, 0)).y()
+                    still_in_view = viewport.rect().contains(
+                        frame.mapTo(viewport, QPoint(0, 0)))
+                    stable = (still_in_view
+                              and top_after == top_before
+                              and bar.value() == scroll_before)
+                    if stable:
+                        self._image_fit_anchor_stable_streak += 1
+                    else:
+                        self._image_fit_anchor_stable_streak = 0
+                    if self._image_fit_anchor_stable_streak < 2 and \
+                            self._image_fit_anchor_ensures \
+                            < _IMAGE_FIT_ANCHOR_MAX_ENSURES:
+                        # Not confirmed stable yet (or the ensure is
+                        # still repairing): one more quiet pass.
+                        self._arm_browser_image_fit()
+                    else:
+                        self._image_fit_anchor_state = 0
+        elif self._image_fit_anchor_state == 1:
+            # A text-only rebuild: nothing to repair, disarm.
+            self._image_fit_anchor_state = 0
+
+    def _update_image_fit_anchor_in_view(self, *_args):
+        """The scrollbar's user-action hook (round 22b): while the
+        anchor is active, every USER scroll action (wheel, drag, keys
+        -- actionTriggered/sliderMoved; programmatic setValue never
+        fires these) refreshes whether the current frame was in view at
+        that scroll position. Layout drift never fires them (moving
+        content does not scroll), Qt's own clamp after a shrunken
+        maximum is a programmatic setValue (not the user's decision --
+        the rescale itself caused it, and the repair below is what
+        answers it), and the form's OWN repositioning is flagged anyway
+        through ``_anchor_internal_scroll``. So an unflagged action
+        here is exactly 'the user scrolled away' (never yanked), as
+        opposed to 'the layout moved under a still viewport'
+        (repairable).
+
+        The re-read is DEFERRED one event-loop turn (round 22 review):
+        actionTriggered fires BEFORE the scrollbar value moves (probed:
+        a wheel step's handler reads the pre-step value while the value
+        lands right after), so reading the frame position inline would
+        record the PRE-step visibility -- a single wheel step that
+        carries the current cell off-screen would leave the stale True
+        and the next quiet pass would yank the view back. At the
+        deferred fire the action's move has landed, and the re-checks
+        (still active, still not an internal repositioning) keep a
+        queued zero-timer from acting on a world that moved on."""
+        if self._image_fit_anchor_state != 2:
+            return
+        if self._anchor_internal_scroll:
+            return
+        QTimer.singleShot(0, self._apply_image_fit_anchor_in_view)
+
+    def _apply_image_fit_anchor_in_view(self):
+        """The deferred half of the user-action hook (round 22 review,
+        see _update_image_fit_anchor_in_view): runs one event-loop turn
+        after the user's scroll action, when the action's value change
+        has landed. A user action that took the current cell away
+        revokes the recorded visibility AND the arm-time saw-visible
+        gate (a pending debounced pass must not re-promote against the
+        user's decision) and retires the anchor immediately, so no
+        scheduled quiet pass can yank the view back."""
+        if self._image_fit_anchor_state != 2:
+            return
+        if self._anchor_internal_scroll:
+            return
+        if self._current_frame_in_view():
+            self._image_fit_anchor_in_view = True
+        else:
+            self._image_fit_anchor_in_view = False
+            self._image_fit_anchor_saw_visible = False
+            self._image_fit_anchor_stable_streak = 0
+            self._image_fit_anchor_state = 0
+
+    def _ensure_current_cell_visible(self):
+        """The scroll ensure behind the debounced image pass (round
+        22b): re-lands the viewport on the current cell's frame with
+        the same margins the round-21 settle uses. Runs at each quiet
+        pass while the anchor is active, until one confirms the
+        geometry stable (or the repetition cap engages -- see
+        _fit_all_browser_images); reads the index at call time and
+        no-ops when it is gone."""
+        index = self._current_cell_index
+        if 0 <= index < len(self._cell_widgets):
+            self._anchor_internal_scroll += 1
+            try:
+                self.scrollArea.ensureWidgetVisible(
+                    self._cell_widgets[index]['frame'], 20, 20)
+            finally:
+                self._anchor_internal_scroll -= 1
+
     def _fit_browser_to_content(self, browser):
         """Grows an output browser to its FULL content height.
 
@@ -2502,7 +2918,9 @@ class DragonflyNotebookForm(QMainWindow):
         the notebook panel is the one vertical scroll area and a nested
         one inside a cell would fight it, so no output scrolls vertically
         however tall it is (the browser's vertical scrollbar policy is
-        AlwaysOff; horizontal stays AsNeeded). Full rendering has no
+        AlwaysOff; since round 22 horizontal is AlwaysOff too -- the
+        round-22 image fit scales over-wide figures into the viewport
+        instead). Full rendering has no
         user-facing cap below ~880k text lines (a height of
         16777215 px, Qt's QWIDGETSIZE_MAX): the ONE exception is Qt's
         own widget limit -- past it setFixedHeight
@@ -2514,15 +2932,19 @@ class DragonflyNotebookForm(QMainWindow):
         browser's vertical policy flips to AsNeeded, so even the
         extreme output stays scrollable and reachable; in every other
         case the fit leaves the policy at AlwaysOff (the normal
-        contract: no nested vertical scrolling). A laid-out document
-        WIDER
-        than the viewport (a wide figure or table) brings the horizontal
-        scrollbar up and eats one scrollbar-height of the viewport, so
-        the fit adds that extent back -- without it the last pixel row
-        clips into a vertical scrollbar. The comparison reads the
-        laid-out geometry, so the fit itself never flips the bar on or
-        off (no feedback loop), and it is idempotent: an unchanged fixed
-        height does not re-enter the layout (probed: two consecutive
+        contract: no nested vertical scrolling). Round 22 drops the
+        horizontal-scrollbar allowance (the round-9 arithmetic that
+        added one scrollbar-height when the laid-out document was wider
+        than the viewport): with the horizontal policy AlwaysOff that
+        bar can never come up, so the allowance is dead arithmetic --
+        the height is content plus the frame fudge only (a document
+        genuinely wider than the viewport can no longer scroll to its
+        right edge; the over-wide figures that made that case real are
+        scaled into the viewport by the round-22 image fit before it
+        matters, and tables still clip rather than scroll -- the price
+        of an unscrollable cell). The fit is idempotent: an unchanged
+        fixed height does not re-enter the layout (probed: two
+        consecutive
         fits, one height, zero signal churn after settling). The
         documentSizeChanged seam in _add_cell_widget (connected before
         any setHtml/setMarkdown) routes every content change here -- the
@@ -2533,8 +2955,6 @@ class DragonflyNotebookForm(QMainWindow):
         post-show truth with no explicit fit at the show sites."""
         height = int(math.ceil(browser.document().size().height())) \
             + _OUTPUT_HEIGHT_FUDGE
-        if browser.document().size().width() > browser.viewport().width():
-            height += browser.horizontalScrollBar().sizeHint().height()
         if height > _MAX_FULL_HEIGHT:
             # The far valve: Qt itself would clamp the fixed height at
             # QWIDGETSIZE_MAX while the vertical policy stays AlwaysOff,
@@ -3220,6 +3640,15 @@ class DragonflyNotebookForm(QMainWindow):
 
         if cell['cell_type'] == 'markdown':
             record['browser'].setMarkdown(code)
+            # Round 22, review: NO direct fit here -- at this instant the
+            # panel scrollbar may still be up (the replaced content's
+            # height has not shrunk yet), so the viewport is a few px
+            # narrow and a direct fit would scale the images wide of the
+            # settled width, then the debounced pass would widen them
+            # again ~140 ms later (a visible pop). Arm the debounced pass
+            # instead: it fits ONCE, at the settled viewport width, after
+            # the layout (and the panel scrollbar) has settled.
+            self._arm_browser_image_fit()
             record['browser'].show()
             # Round 11: running a markdown cell swaps the editor for the
             # rendered view -- the id leaves the EDIT set, so the mode
@@ -3386,11 +3815,22 @@ class DragonflyNotebookForm(QMainWindow):
         self._append_live_html(render_outputs_html(
             [{'output_type': 'display_data', 'data': data,
               'metadata': metadata}]))
+        # Round 22: a display payload can carry a figure -- the fit runs
+        # HERE (once per payload), never per stream chunk: streaming
+        # text arrives one line at a time and re-walking the document
+        # per line would be O(document) work per streamed line.
+        record = self._running_record()
+        if record is not None:
+            self._fit_browser_images_to_width(record['browser'])
 
     def _on_result_arrived(self, data, metadata):
         self._append_live_html(render_outputs_html(
             [{'output_type': 'execute_result', 'data': data,
               'metadata': metadata, 'execution_count': None}]))
+        # Round 22: same rule as the display payload above.
+        record = self._running_record()
+        if record is not None:
+            self._fit_browser_images_to_width(record['browser'])
 
     def _on_error_arrived(self, ename, evalue, traceback_lines):
         self._append_live_html(render_outputs_html(
@@ -3558,6 +3998,10 @@ class DragonflyNotebookForm(QMainWindow):
             browser.show()
         else:
             browser.hide()
+        # Round 22: the authoritative render's figures are scaled to the
+        # available width (the run-finished path, and the restore path
+        # the suite uses -- an empty render just finds no images).
+        self._fit_browser_images_to_width(browser)
         self._update_cell_header(index)
 
     def _update_cell_header(self, index):

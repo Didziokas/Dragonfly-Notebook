@@ -86,9 +86,16 @@ plugin manager sees it (namespace package
       to the document at vbar max 0, a 600x300 figure shows fully; round
       21: every output renders at its FULL content height past the
       retired 400 px cap -- vertical scrollbar policy AlwaysOff, no
-      nested vertical scrolling; a wide image keeps its horizontal
-      scrollbar without vertical clipping, and a tall rendered markdown
-      cell takes its full content height too), the
+      nested vertical scrolling; a tall rendered markdown
+      cell takes its full content height too; round 22: NO horizontal
+      scrolling either -- both policies AlwaysOff, and an image larger
+      than the viewport is SCALED DOWN uniformly to the available width,
+      aspect preserved, never upscaled, on every content path (rendered
+      outputs, live display payloads, markdown embeds) and re-fitted
+      through ONE debounced pass when the window is resized, the width
+      tracking min(intrinsic, available) at every size; a wide embedded
+      PNG in a rendered markdown cell scales too, and the far-valve and
+      scroll-preservation pins below are untouched), the
       Qt-free .ipynb drop decision truth table, the cell editors'
       ignore-the-.ipynb-drag contract (no URL text inserted, snippet
       drags still accepted), the form-level drop (a valid local .ipynb
@@ -104,7 +111,13 @@ plugin manager sees it (namespace package
       geometry over several zero-turns, so the deferred settle chains
       BOUNDED passes while the layout is still moving or the frame is
       out of view; the outputless first fixture and a visibility-only
-      retry both let a mid-cascade pass slip through), the full-height
+      retry both let a mid-cascade pass slip through; round 22b: the
+      FIGURE-RICH shape of the same contract -- the debounced image pass
+      rescales stored figures AFTER the settle finishes, so the anchor's
+      quiet passes hand the viewport back to the current cell (delete
+      and resize-narrower, pumped past the 140 ms debounce, stored
+      figure scaled, no scrollbar either way) while a current cell the
+      user scrolled far off-screen is never yanked back), the full-height
       fit's far safety valve (_MAX_FULL_HEIGHT,
       engaged only past Qt's own widget limit: the height pins at the
       ceiling and that browser flips to AsNeeded, every normal fit
@@ -484,9 +497,9 @@ from PyQt6.QtCore import (QBuffer, QEvent, QEventLoop, QPoint, QPointF,  # noqa:
                           QRect, QMimeData, Qt, QUrl)
 from PyQt6.QtGui import (QDragEnterEvent, QDropEvent, QFontMetrics, QImage,  # noqa: E402
                          QKeyEvent, QMouseEvent)
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QFrame,
-                             QLabel, QMainWindow,  # noqa: E402
-                             QPushButton, QScrollArea)
+from PyQt6.QtWidgets import (QAbstractSlider, QApplication, QCheckBox,  # noqa: E402
+                             QDialog, QFrame, QLabel, QMainWindow,
+                             QPushButton, QScrollArea, QTextBrowser)
 
 from ORSModel import Channel as OrsChannel  # noqa: E402  (fixtures)
 from ORSModel import createChannelFromNumpyArray  # noqa: E402
@@ -2285,8 +2298,12 @@ try:
     # the panel is the one vertical scroll area, nothing inside a cell
     # scrolls vertically -- so verticalScrollBar().maximum() MUST be 0
     # whatever the output's height, and the vertical scrollbar policy is
-    # AlwaysOff. Wide content keeps a horizontal scrollbar (policy
-    # AsNeeded). The outputs ride the form's REAL paths -- the
+    # AlwaysOff. Round 22: horizontal scrolling is gone too -- BOTH
+    # policies are AlwaysOff, and a figure larger than the viewport is
+    # SCALED DOWN uniformly to the available width instead of scrolling
+    # (the round-22 image fit, below; the source EDITOR's behavior is
+    # not this pin's subject -- code editing keeps its round-9 wrap-and-
+    # grow contract). The outputs ride the form's REAL paths -- the
     # live streaming chunk (_append_live_html, what a running cell
     # grows) and the authoritative re-render (_render_outputs, what
     # run-finished writes) -- and the output area is restored to its
@@ -2298,9 +2315,9 @@ try:
     result(output_browser.verticalScrollBarPolicy()
            == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
            and output_browser.horizontalScrollBarPolicy()
-           == Qt.ScrollBarPolicy.ScrollBarAsNeeded,
-           "an output browser scrolls horizontally only (vertical policy "
-           "AlwaysOff, horizontal AsNeeded)")
+           == Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+           "an output browser scrolls in NEITHER direction (both policies "
+           "AlwaysOff; round 22 removed the horizontal bar)")
     form._render_outputs(output_index, [])
     app.processEvents()
     form._running = True
@@ -2372,11 +2389,37 @@ try:
                output_browser.height(),
                output_browser.verticalScrollBar().maximum()))
 
+    # The round-22 readback helpers: the image fragments of a document
+    # (their QTextImageFormat width/height, in document order -- the
+    # scaled geometry the fit wrote) and a real-time pump that lets the
+    # ONE debounced image-fit pass fire after a form resize (the
+    # resize filter arms the single-shot timer; the pump spins
+    # processEvents past the 140 ms window).
+    def image_fragment_formats(document):
+        out = []
+        block = document.firstBlock()
+        while block.isValid():
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid() and frag.charFormat().isImageFormat():
+                    imf = frag.charFormat().toImageFormat()
+                    out.append((imf.width(), imf.height()))
+                it += 1
+            block = block.next()
+        return out
+
+    def settle_image_fit(seconds=0.4):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            app.processEvents()
+            time.sleep(0.01)
+
     # The WIDE output, line case (round 21): a 220-character line WRAPS
-    # (the renderer emits pre-wrap), so no horizontal scrollbar is
-    # needed and the vertical scrollbar stays at 0 -- the bar is
-    # AVAILABLE (policy AsNeeded) for whatever genuinely overflows, and
-    # two consecutive fits settle on one height.
+    # (the renderer emits pre-wrap), so no scrollbar is needed in either
+    # direction and two consecutive fits settle on one height. (Round 22:
+    # the horizontal policy assertion below is AlwaysOff -- no bar in
+    # either direction.)
     wide_line = "x" * 220
     form._render_outputs(output_index, [
         {"output_type": "stream", "name": "stdout",
@@ -2393,21 +2436,22 @@ try:
            and output_browser.height() == wide_line_first
            and output_browser.verticalScrollBar().maximum() == 0
            and output_browser.horizontalScrollBarPolicy()
-           == Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+           == Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
            "a 220-character line output wraps and does not clip (height "
            "{} = ceil({:.1f}) + {} fudge, two fits one height, vbar max "
-           "{}, horizontal policy AsNeeded)".format(
+           "{}, both policies AlwaysOff)".format(
                output_browser.height(), wide_line_doc,
                installed_form._OUTPUT_HEIGHT_FUDGE,
                output_browser.verticalScrollBar().maximum()))
 
-    # The WIDE output, overflow case: a 1200x100 PNG is wider than the
-    # ~850 px viewport, so the horizontal scrollbar really comes up
-    # (maximum() > 0) and it eats one scrollbar-height of the viewport
-    # -- the fit must carry that extent or the image's last pixel row
-    # clips into a vertical scrollbar. The honest ground truths: vbar
-    # max 0 (nothing clipped), the bar really up, and the height at
-    # least content + fudge + the scrollbar's own extent.
+    # The WIDE output, image case (round 22, rewritten from the round-21
+    # scroll-overflow form): a 1200x100 PNG is wider than the ~700 px
+    # browser viewport, and instead of a horizontal scrollbar it is
+    # SCALED DOWN uniformly to the available width -- aspect preserved
+    # within 1 px, no scrollbar in either direction, and the laid-out
+    # document no wider than the viewport. The fit ran through the REAL
+    # path (_render_outputs' direct call at viewport width) plus the
+    # debounced pass that the documentSizeChanged seam armed.
     wide_img = QImage(1200, 100, QImage.Format.Format_RGB32)
     wide_img.fill(0xFF3A5F9E)
     wide_buf = QBuffer()
@@ -2420,20 +2464,150 @@ try:
         {"output_type": "display_data", "data": {"image/png": wide_b64},
          "metadata": {}}])
     app.processEvents()
-    wide_doc_h = output_browser.document().size().height()
-    hbar_extent = output_browser.horizontalScrollBar().sizeHint().height()
-    result(output_browser.horizontalScrollBar().maximum() > 0
+    wide_avail = installed_cells.available_image_width(output_browser)
+    wide_fmts = image_fragment_formats(output_browser.document())
+    wide_expected_h = round(100 * wide_avail / 1200)
+    result(len(wide_fmts) == 1
+           and abs(wide_fmts[0][0] - wide_avail) <= 0.5
+           and abs(wide_fmts[0][1] - wide_expected_h) <= 1.0
+           and output_browser.horizontalScrollBar().maximum() == 0
            and output_browser.verticalScrollBar().maximum() == 0
-           and output_browser.height() >= int(math.ceil(wide_doc_h))
-           + installed_form._OUTPUT_HEIGHT_FUDGE + hbar_extent,
-           "a viewport-wider-than-panel image keeps its horizontal "
-           "scrollbar WITHOUT vertical clipping (hbar max {}, vbar max "
-           "{}, height {} >= ceil({:.1f}) + {} fudge + {} hbar "
-           "extent)".format(
+           and output_browser.document().size().width()
+           <= output_browser.viewport().width()
+           and output_browser.height()
+           == int(math.ceil(output_browser.document().size().height()))
+           + installed_form._OUTPUT_HEIGHT_FUDGE,
+           "a viewport-wider-than-panel image renders SCALED to the "
+           "available width ({}x{} -> {:.0f}x{:.0f}, avail {}, aspect "
+           "within 1 px, hbar max {}, vbar max {}, doc w {:.0f} <= "
+           "viewport {}, full-height fit)".format(
+               1200, 100, wide_fmts[0][0], wide_fmts[0][1], wide_avail,
                output_browser.horizontalScrollBar().maximum(),
                output_browser.verticalScrollBar().maximum(),
-               output_browser.height(), wide_doc_h,
-               installed_form._OUTPUT_HEIGHT_FUDGE, hbar_extent))
+               output_browser.document().size().width(),
+               output_browser.viewport().width(),))
+
+    # Uniform-scaling exactness on a SECOND intrinsic size (round 22):
+    # a 900x300 figure gets the same width fit with its own proportional
+    # height -- the scale is generic, not tuned to one shape.
+    mid_img = QImage(900, 300, QImage.Format.Format_RGB32)
+    mid_img.fill(0xFF5F3A9E)
+    mid_buf = QBuffer()
+    mid_buf.open(QBuffer.OpenModeFlag.ReadWrite)
+    result(mid_img.save(mid_buf, "PNG"),
+           "the uniform pin encoded its 900x300 PNG")
+    mid_b64 = base64.b64encode(bytes(mid_buf.data())).decode("ascii")
+    mid_buf.close()
+    form._render_outputs(output_index, [
+        {"output_type": "display_data", "data": {"image/png": mid_b64},
+         "metadata": {}}])
+    app.processEvents()
+    mid_avail = installed_cells.available_image_width(output_browser)
+    mid_fmts = image_fragment_formats(output_browser.document())
+    result(len(mid_fmts) == 1
+           and abs(mid_fmts[0][0] - min(900, mid_avail)) <= 0.5
+           and abs(mid_fmts[0][1] - round(300 * mid_fmts[0][0] / 900))
+           <= 1.0
+           and output_browser.horizontalScrollBar().maximum() == 0
+           and output_browser.verticalScrollBar().maximum() == 0,
+           "a 900x300 figure scales with the SAME width-fit rule "
+           "({:.0f}x{:.0f}, avail {}, aspect preserved, hbar max {}, vbar "
+           "max {})".format(mid_fmts[0][0], mid_fmts[0][1], mid_avail,
+                            output_browser.horizontalScrollBar().maximum(),
+                            output_browser.verticalScrollBar().maximum()))
+
+    # NEVER upscaling (round 22): a small 100x50 image in a wide viewport
+    # keeps its intrinsic size -- the fit only ever shrinks.
+    small_img = QImage(100, 50, QImage.Format.Format_RGB32)
+    small_img.fill(0xFF3A5F9E)
+    small_buf = QBuffer()
+    small_buf.open(QBuffer.OpenModeFlag.ReadWrite)
+    result(small_img.save(small_buf, "PNG"),
+           "the no-upscale pin encoded its 100x50 PNG")
+    small_b64 = base64.b64encode(bytes(small_buf.data())).decode("ascii")
+    small_buf.close()
+    form._render_outputs(output_index, [
+        {"output_type": "display_data", "data": {"image/png": small_b64},
+         "metadata": {}}])
+    app.processEvents()
+    small_fmts = image_fragment_formats(output_browser.document())
+    result(len(small_fmts) == 1 and small_fmts[0][0] == 100.0
+           and small_fmts[0][1] == 50.0
+           and output_browser.horizontalScrollBar().maximum() == 0,
+           "a small image is NOT upscaled (fragment {}x{} stays "
+           "intrinsic, hbar max {})".format(
+               small_fmts[0][0], small_fmts[0][1],
+               output_browser.horizontalScrollBar().maximum()))
+
+    # The RESIZE battery (round 22): the user drags the window -- the
+    # viewport resize filter arms the ONE debounced pass, which re-fits
+    # every cell browser with the CURRENT widths. Wide (1400), narrow
+    # (560), wide again; at each width the figure width must track
+    # min(intrinsic, available) -- shrunk in the narrow window, restored
+    # to the intrinsic 900 in the wide ones (never past it) -- with no
+    # scrollbar in either direction, and two consecutive settles must be
+    # idempotent. Each step pumps PAST the 140 ms debounce, so the pin
+    # exercises the real filter -> timer -> pass chain, not a direct
+    # call.
+    form._render_outputs(output_index, [
+        {"output_type": "display_data", "data": {"image/png": mid_b64},
+         "metadata": {}}])
+    settle_image_fit()
+    resize_expectations = ((1400, 900), (560, 900), (1400, 900))
+    for resize_width, resize_height in resize_expectations:
+        form.resize(resize_width, resize_height)
+        settle_image_fit()
+        battery_avail = installed_cells.available_image_width(output_browser)
+        battery_fmts = image_fragment_formats(output_browser.document())
+        battery_expected_w = min(900, battery_avail)
+        result(len(battery_fmts) == 1
+               and abs(battery_fmts[0][0] - battery_expected_w) <= 0.5
+               and abs(battery_fmts[0][1]
+                       - round(300 * battery_expected_w / 900)) <= 1.0
+               and output_browser.horizontalScrollBar().maximum() == 0
+               and output_browser.verticalScrollBar().maximum() == 0,
+               "after a form resize to {}x{} the figure width tracks "
+               "min(intrinsic, available) ({:.0f}x{:.0f}, avail {}, hbar "
+               "max {}, vbar max {})".format(
+                   resize_width, resize_height, battery_fmts[0][0],
+                   battery_fmts[0][1], battery_avail,
+                   output_browser.horizontalScrollBar().maximum(),
+                   output_browser.verticalScrollBar().maximum()))
+    battery_before = image_fragment_formats(output_browser.document())
+    battery_height = output_browser.height()
+    settle_image_fit()
+    settle_image_fit()
+    result(image_fragment_formats(output_browser.document())
+           == battery_before
+           and output_browser.height() == battery_height,
+           "two consecutive settles after the battery are idempotent "
+           "(fragment {} both times, height {})".format(
+               battery_before, battery_height))
+
+    # The LIVE display payload (round 22): a display_data image arriving
+    # DURING a run goes through _on_display_arrived -> _append_live_html,
+    # and the fit runs THERE (once per payload, never per stream chunk).
+    # The running state is driven the way the suite drives the live-text
+    # path above; the appended image is the document's LAST fragment.
+    form._running = True
+    form._running_cell_index = output_index
+    try:
+        form._on_display_arrived({"image/png": wide_b64}, {})
+    finally:
+        form._running = False
+        form._running_cell_index = -1
+    app.processEvents()
+    live_avail = installed_cells.available_image_width(output_browser)
+    live_fmts = image_fragment_formats(output_browser.document())
+    result(len(live_fmts) >= 2
+           and abs(live_fmts[-1][0] - min(1200, live_avail)) <= 0.5
+           and abs(live_fmts[-1][1] - round(100 * live_fmts[-1][0] / 1200))
+           <= 1.0
+           and output_browser.horizontalScrollBar().maximum() == 0,
+           "a live display_data image is scaled on arrival (last fragment "
+           "{:.0f}x{:.0f}, avail {}, hbar max {})".format(
+               live_fmts[-1][0], live_fmts[-1][1], live_avail,
+               output_browser.horizontalScrollBar().maximum()))
 
     # Idempotence: two consecutive fits settle on the SAME fixed height
     # (an unchanged setFixedHeight must not re-enter the layout).
@@ -2690,12 +2864,92 @@ try:
                md_browser.height(), md_doc_h,
                installed_form._OUTPUT_HEIGHT_FUDGE,
                md_browser.verticalScrollBar().maximum()))
+
+    # The GENERIC promise covers markdown too (round 22): a rendered
+    # markdown cell whose source embeds a WIDE LOCAL PNG (a real temp
+    # file, the absolute path in the markdown image syntax) is scaled to
+    # the available width exactly like an output figure -- same
+    # fit_document_images, same width arithmetic. The render goes
+    # through the real user flow (Edit flip, editor text, run), and the
+    # cell is left RENDERED for the flip-back pin below.
+    form._on_markdown_edit_button_clicked(markdown_index)
+    md_wide_img = QImage(2000, 400, QImage.Format.Format_RGB32)
+    md_wide_img.fill(0xFF3A5F9E)
+    md_png_path = os.path.join(tempfile.mkdtemp(prefix="dfnb_r22_md_"),
+                               "md_wide.png")
+    result(md_wide_img.save(md_png_path, "PNG"),
+           "the markdown wide pin encoded its 2000x400 PNG")
+    form._cell_widgets[markdown_index]["editor"].setPlainText(
+        "## wide image\n\n![figure]({})\n".format(
+            md_png_path.replace("\\", "/")))
+    app.processEvents()
+    result(form._run_cell_at(markdown_index) is False,
+           "the markdown wide-image cell renders instead of the kernel")
+    app.processEvents()
+    # The markdown render now ARMS the debounced pass instead of fitting
+    # directly (round 22 review: a render-time direct fit lands while
+    # the main scrollbar is still up and scales ~15 px narrow, then the
+    # debounced pass widens it -- a visible pop), so the settled width
+    # exists only after that pass runs: the pump here is the honest
+    # wait, not a paper-over.
+    settle_image_fit(0.35)
+    md_avail = installed_cells.available_image_width(md_browser)
+    md_fmts = image_fragment_formats(md_browser.document())
+    result(len(md_fmts) == 1
+           and md_fmts[0][0] < 2000.0
+           and abs(md_fmts[0][0] - min(2000, md_avail)) <= 0.5
+           and abs(md_fmts[0][1] - round(400 * md_fmts[0][0] / 2000))
+           <= 1.0
+           and md_browser.horizontalScrollBar().maximum() == 0,
+           "a rendered markdown cell's wide embedded PNG is scaled to "
+           "the available width ({:.0f}x{:.0f}, avail {}, aspect "
+           "preserved, hbar max {})".format(
+               md_fmts[0][0], md_fmts[0][1], md_avail,
+               md_browser.horizontalScrollBar().maximum()))
     form._on_markdown_edit_button_clicked(markdown_index)
     app.processEvents()
     result(md_browser.isHidden()
            and form._cell_widgets[markdown_index]["editor"].isVisible(),
            "flipping a rendered markdown cell back to EDIT hides the "
            "browser and shows the editor")
+
+    # Round 22 review: the generic fit is image-FORMAT agnostic -- a
+    # data:image/jpeg figure decodes and sizes through the SAME
+    # QImageReader-on-decoded-bytes path a PNG takes (probed: both
+    # formats report their true sizes) and must scale identically.
+    # Pinned as a direct fragment on a standalone visible browser (the
+    # cheapest honest probe: the same available_image_width and
+    # fit_document_images every render path calls).
+    jpeg_img = QImage(1600, 300, QImage.Format.Format_RGB32)
+    jpeg_img.fill(0xFF5F9E3A)
+    jpeg_buf = QBuffer()
+    jpeg_buf.open(QBuffer.OpenModeFlag.ReadWrite)
+    result(jpeg_img.save(jpeg_buf, "JPEG"),
+           "the jpeg data-URL pin encoded its 1600x300 JPEG")
+    jpeg_b64 = base64.b64encode(bytes(jpeg_buf.data())).decode("ascii")
+    jpeg_buf.close()
+    jpeg_browser = QTextBrowser()
+    jpeg_browser.resize(800, 300)
+    jpeg_browser.show()
+    app.processEvents()
+    jpeg_avail = installed_cells.available_image_width(jpeg_browser)
+    jpeg_browser.setHtml(
+        '<p><img src="data:image/jpeg;base64,{}"></p>'.format(jpeg_b64))
+    app.processEvents()
+    jpeg_changed = installed_cells.fit_document_images(
+        jpeg_browser.document(), jpeg_avail)
+    jpeg_fmts = image_fragment_formats(jpeg_browser.document())
+    result(jpeg_changed >= 1
+           and len(jpeg_fmts) == 1
+           and abs(jpeg_fmts[0][0] - min(1600, jpeg_avail)) <= 0.5
+           and abs(jpeg_fmts[0][1] - round(300 * jpeg_fmts[0][0] / 1600))
+           <= 1.0,
+           "a data:image/jpeg figure scales like a PNG (fragment {} "
+           "avail {}, changed {})".format(jpeg_fmts, jpeg_avail,
+                                          jpeg_changed))
+    jpeg_browser.hide()
+    jpeg_browser.deleteLater()
+    app.processEvents()
 
     # The far safety valve (round 21): the full-height fit has no
     # user-facing cap, but Qt itself refuses widgets taller than
@@ -2834,6 +3088,153 @@ try:
                   lambda: form._navigate_after_run(
                       form.document.cell_count() - 1, insert_after=False),
                   form.document.cell_count() - 1)
+
+    # The round-22b anchor pin: the FIGURE-RICH shape of the same
+    # contract. The repro above carried tall TEXT outputs; the debounced
+    # image pass (round 22) rescales STORED figures about 140 ms after a
+    # structural action, and that height change lands AFTER the round-21
+    # settle chain has finished -- without the anchor the viewport
+    # drifts off the current cell in exactly the most common real
+    # notebook (matplotlib outputs). Re-record the same notebook with a
+    # 1200x400 stored display_data figure per code cell, then (a) a
+    # delete and (b) a resize narrower, each pumped PAST the image
+    # debounce; the viewport must still be on the current cell, the
+    # stored figure scaled, and no scrollbar in either direction. The
+    # control pins the no-yank rule: with the current cell scrolled FAR
+    # off-screen (the user's own decision), a resize must not move the
+    # scroll value.
+    anchor_img = QImage(1200, 400, QImage.Format.Format_RGB32)
+    anchor_img.fill(0xFF3A5F9E)
+    anchor_buf = QBuffer()
+    anchor_buf.open(QBuffer.OpenModeFlag.ReadWrite)
+    result(anchor_img.save(anchor_buf, "PNG"),
+           "the anchor pin encoded its 1200x400 PNG")
+    anchor_b64 = base64.b64encode(bytes(anchor_buf.data())).decode("ascii")
+    anchor_buf.close()
+    while form.document.cell_count() > 14:
+        form.document.remove_cell(form.document.cell_count() - 1)
+    for _index in range(form.document.cell_count()):
+        form.document.set_cell_source(_index, "import numpy")
+        form.document.record_execution(
+            _index, _index + 1,
+            [{"output_type": "display_data",
+              "data": {"image/png": anchor_b64}, "metadata": {}}])
+    form._rebuild_cells()
+    _pump()
+    settle_image_fit(1.0)
+    result(form.document.cell_count() == 14,
+           "the anchor pin rebuilt its 14-cell figure-rich notebook "
+           "(each cell a stored 1200x400 display_data figure)")
+
+    form._focus_cell(8)
+    settle_image_fit(0.3)
+    anchor_current = 8
+    anchor_top = form._cell_widgets[anchor_current]["frame"].mapTo(
+        form.scrollArea.viewport(), QPoint(0, 0)).y()
+    scroll_bar.setValue(scroll_bar.value() + anchor_top - 30)
+    settle_image_fit(0.3)
+    result(_frame_in_viewport(anchor_current),
+           "the anchor pin's baseline has the current figure cell in "
+           "view near the viewport top (current {}, top {})".format(
+               anchor_current, anchor_top))
+
+    # (a) the structural delete: pump past the round-21 settle AND the
+    # image debounce; the anchor's quiet pass must hand the viewport
+    # back to the (now) current cell after the figures above shrank.
+    form.on_delete_cell()
+    settle_image_fit(0.9)
+    anchor_current = form._current_cell_index
+    anchor_browser = form._cell_widgets[anchor_current]["browser"]
+    anchor_avail = installed_cells.available_image_width(anchor_browser)
+    anchor_fmts = image_fragment_formats(anchor_browser.document())
+    result(_frame_in_viewport(anchor_current)
+           and len(anchor_fmts) >= 1
+           and anchor_fmts[0][0] <= anchor_avail + 0.5
+           and anchor_browser.horizontalScrollBar().maximum() == 0
+           and anchor_browser.verticalScrollBar().maximum() == 0,
+           "after a delete the viewport is still on the current cell of "
+           "the figure-rich notebook and the stored figure is scaled "
+           "(current {}, fragment {} avail {}, hbar max {}, vbar max {})"
+           .format(anchor_current, anchor_fmts, anchor_avail,
+                   anchor_browser.horizontalScrollBar().maximum(),
+                   anchor_browser.verticalScrollBar().maximum()))
+
+    # (b) the window resize narrower: same rule through the resize
+    # filter. The current frame is re-anchored to the viewport top
+    # FIRST (the (a) end state differs between the anchored and
+    # unanchored worlds), so an above-content shrink cannot hide behind
+    # a lucky intersection.
+    anchor_top = form._cell_widgets[anchor_current]["frame"].mapTo(
+        form.scrollArea.viewport(), QPoint(0, 0)).y()
+    scroll_bar.setValue(scroll_bar.value() + anchor_top - 30)
+    settle_image_fit(0.3)
+    form.resize(560, 900)
+    settle_image_fit(0.9)
+    anchor_current = form._current_cell_index
+    anchor_browser = form._cell_widgets[anchor_current]["browser"]
+    anchor_avail = installed_cells.available_image_width(anchor_browser)
+    anchor_fmts = image_fragment_formats(anchor_browser.document())
+    result(_frame_in_viewport(anchor_current)
+           and len(anchor_fmts) >= 1
+           and anchor_fmts[0][0] <= anchor_avail + 0.5
+           and anchor_browser.horizontalScrollBar().maximum() == 0
+           and anchor_browser.verticalScrollBar().maximum() == 0,
+           "after a narrower resize the viewport is still on the current "
+           "cell and the figure re-scaled (current {}, fragment {} avail "
+           "{}, hbar max {}, vbar max {})".format(
+               anchor_current, anchor_fmts, anchor_avail,
+               anchor_browser.horizontalScrollBar().maximum(),
+               anchor_browser.verticalScrollBar().maximum()))
+
+    # The ACTIVE-anchor no-yank pin (round 22 review): a USER scroll
+    # action while the anchor is ACTIVE must retire it WITHOUT an
+    # ensure. The wheel step's actionTriggered fires BEFORE the
+    # scrollbar value moves, so the form defers its re-read one
+    # event-loop turn; the pin drives the same seam the wheel uses --
+    # emit the action FIRST, then move the value (the move lands after
+    # the signal) -- and pumps past the deferred hook and the quiet
+    # passes: the scroll value must stay where the user left it and the
+    # anchor must be retired.
+    anchor_top = form._cell_widgets[anchor_current]["frame"].mapTo(
+        form.scrollArea.viewport(), QPoint(0, 0)).y()
+    scroll_bar.setValue(scroll_bar.value() + anchor_top - 30)
+    settle_image_fit(0.3)
+    form.resize(1400, 900)
+    active_deadline = time.monotonic() + 2.0
+    while time.monotonic() < active_deadline \
+            and form._image_fit_anchor_state != 2:
+        app.processEvents()
+        time.sleep(0.005)
+    result(form._image_fit_anchor_state == 2,
+           "the widening resize re-promoted the anchor while the current "
+           "cell is in view (state {})".format(
+               form._image_fit_anchor_state))
+    scroll_bar.actionTriggered.emit(
+        QAbstractSlider.SliderAction.SliderSingleStepAdd.value)
+    scroll_bar.setValue(0)
+    settle_image_fit(0.6)
+    result(form._image_fit_anchor_state == 0
+           and scroll_bar.value() == 0
+           and not _frame_in_viewport(anchor_current),
+           "a user scroll while the anchor is active retires it without "
+           "yanking the view back (state {}, scroll {})".format(
+               form._image_fit_anchor_state, scroll_bar.value()))
+
+    # The no-yank control, IDLE-anchor shape (the arm-time gate): with
+    # the anchor retired and the current cell scrolled FAR off-screen
+    # (the user's own scroll), a resize must not move the scroll value
+    # -- no arm saw the frame in view, so the anchor never promotes.
+    scroll_bar.setValue(0)
+    settle_image_fit(0.25)
+    anchor_before = scroll_bar.value()
+    form.resize(1000, 900)
+    settle_image_fit(0.6)
+    anchor_after = scroll_bar.value()
+    result(abs(anchor_after - anchor_before) <= 2
+           and not _frame_in_viewport(anchor_current),
+           "with the current cell scrolled far off-screen a resize does "
+           "not yank the scroll ({} -> {})".format(
+               anchor_before, anchor_after))
 
     # Opening a notebook still lands at the TOP: a load rebuilds with no
     # focus index (cell 0) and the deferred settle must not move the
