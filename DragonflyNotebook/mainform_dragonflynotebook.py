@@ -3637,7 +3637,9 @@ class DragonflyNotebookForm(QMainWindow):
         the bookkeeping (record, re-render, elapsed pin, navigation, Run
         All chaining). Returns True when a code run was started, False for
         a markdown cell (previewed inline instead -- and run-INERT once
-        rendered, round 12) or a refused run.
+        rendered, round 12), a completely empty code cell (a full no-op,
+        round 24: nothing starts, nothing is synced, nothing navigates)
+        or a refused run.
         ``run_total`` (Run All only) labels the status 'cell N of M'."""
         if self._running:
             self._set_status('A cell is already running -- wait for it.')
@@ -3654,6 +3656,19 @@ class DragonflyNotebookForm(QMainWindow):
             # touch, no dirty flag). Run All already skips markdown.
             return False
         code = record['editor'].toPlainText()
+        if cell['cell_type'] == 'code' and not code.strip():
+            # Round 24: a COMPLETELY empty code cell (whitespace-only
+            # included) is a COMPLETE NO-OP run: no kernel start, no
+            # source sync (the document must not turn dirty because of
+            # it), no execution count, no outputs, no status change, no
+            # navigation -- an advance or insert-after on an empty cell
+            # neither appends nor inserts, and no rebuild moves the
+            # scroll. Inside a Run All chain the chain must not stall:
+            # hop to the next non-empty code cell (or finish the chain)
+            # WITHOUT counting the skipped cell as run.
+            if run_total and self._run_all_active:
+                self._advance_run_all(index)
+            return False
         self.document.set_cell_source(index, code)
 
         if cell['cell_type'] == 'markdown':
@@ -3938,10 +3953,12 @@ class DragonflyNotebookForm(QMainWindow):
         self._update_env_controls()
 
     def _continue_run_all(self, index, interrupted):
-        """The Run All chain, advanced from _on_run_finished: the next code
-        cell starts on a zero-timer hop (no recursion inside a signal
-        handler); an interrupted cell stops the chain (an interrupt is a
-        stop, not the rest of the notebook)."""
+        """The Run All chain, advanced from _on_run_finished: the next
+        non-empty code cell starts on a zero-timer hop (no recursion
+        inside a signal handler); an interrupted cell stops the chain (an
+        interrupt is a stop, not the rest of the notebook). Round 24: the
+        hop skips completely empty code cells -- only cells that actually
+        ran increment the ran count."""
         if not self._run_all_active:
             return
         self._run_all_ran += 1
@@ -3949,9 +3966,19 @@ class DragonflyNotebookForm(QMainWindow):
             self._run_all_active = False
             self._set_status('Run All stopped at cell {}.'.format(index + 1))
             return
+        self._advance_run_all(index)
+
+    def _advance_run_all(self, index):
+        """The Run All chain's ONE hop (round 24, shared by the
+        run-finished advance and the empty-cell skip inside
+        ``_run_cell_at``): the next NON-EMPTY code cell after ``index``
+        starts on a zero-timer hop (no recursion inside a signal
+        handler); when none follows, the chain ends with the summary
+        status -- the count names only the cells that actually ran."""
         next_index = next(
             (i for i in range(index + 1, self.document.cell_count())
-             if self.document.get_cell(i)['cell_type'] == 'code'), None)
+             if self.document.get_cell(i)['cell_type'] == 'code'
+             and self.document.get_cell(i)['source'].strip()), None)
         if next_index is None:
             self._run_all_active = False
             self._set_status('Run All finished ({} code cells) -- {}'.format(
@@ -4035,13 +4062,19 @@ class DragonflyNotebookForm(QMainWindow):
             self._set_status('A cell is already running -- wait for it.')
             return
         self._sync_editors_to_document()
+        # Round 24: the totals and the chain's first pick count only
+        # NON-EMPTY code cells -- a completely empty code cell (whitespace
+        # only included) is skipped by the run, so it is not a cell to run.
+        def _runnable(index):
+            cell = self.document.get_cell(index)
+            return cell['cell_type'] == 'code' and cell['source'].strip()
         total = sum(1 for index in range(self.document.cell_count())
-                    if self.document.get_cell(index)['cell_type'] == 'code')
+                    if _runnable(index))
         if not total:
-            self._set_status('No code cells to run.')
+            self._set_status('No non-empty code cells to run.')
             return
         first = next(i for i in range(self.document.cell_count())
-                     if self.document.get_cell(i)['cell_type'] == 'code')
+                     if _runnable(i))
         self._run_all_active = True
         self._run_all_total = total
         self._run_all_ran = 0

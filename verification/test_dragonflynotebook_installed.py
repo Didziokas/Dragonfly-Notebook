@@ -214,7 +214,24 @@ plugin manager sees it (namespace package
       built cell's editor and browser being a child of the form; the
       drop-filter lifetime pins hold the PROCESS lifetime (install +
       idempotence through _ensure_drop_filter, and the last instance's
-      real cleanup leaving the filter installed).
+      real cleanup leaving the filter installed);
+  (12) round 24, the empty-cell no-op: a COMPLETELY empty code cell
+      (whitespace-only included) run is a full no-op -- the Run button
+      and both advance chords start nothing, sync nothing (the document
+      stays clean), navigate nowhere (no append, no insert, no rebuild,
+      both scrollbars unmoved, the widget records keep their
+      identities); markdown cells are out of scope by design (an empty
+      markdown EDIT cell still renders inline); Run All counts only
+      non-empty code cells in its totals, its first pick and its hop (a
+      notebook of empties answers 'No non-empty code cells to run.' and
+      starts nothing), pinned without a kernel on the headless form and
+      executed for real over [empty, '1 + 1', empty, '2 + 2']: exactly
+      the two non-empty cells run in order, the empties stay count-less
+      and output-less, the chain finishes with the summary counting only
+      the ran cells, no extra cell is appended and the scroll is stable;
+      the guard's own hop driven on the empty first cell runs the rest
+      of the chain; a non-empty Shift+Enter still appends and focuses
+      the fresh cell.
 
 ``DFNB_INSTALL_ROOT`` overrides the installed-root probe with one explicit
 data root: the pre-install staging seam. With install=false the suite can
@@ -1677,6 +1694,110 @@ try:
                "running_in_test ({} entries)".format(len(log_handler2.records)))
     finally:
         form_logger.removeHandler(log_handler2)
+
+    # Round 24, the empty-cell no-op pins: a COMPLETELY empty code cell
+    # (whitespace-only included) run is a COMPLETE NO-OP -- no kernel
+    # start, no source sync (the document stays clean), no execution
+    # count, no outputs, no status change, no navigation (Shift+Enter
+    # neither advances nor appends, Alt+Enter inserts nothing), no
+    # rebuild (every cell widget record keeps its identity) and no
+    # movement on either scrollbar of the cells panel. The actions are
+    # driven through the EXACT handlers the real affordances invoke: the
+    # run button's dispatcher and the editors' runRequested /
+    # runAdvanceRequested / runInsertRequested emissions (the chord
+    # wiring). Markdown cells are OUT of scope by design: an empty
+    # markdown EDIT cell still renders inline (the round-11 semantics,
+    # untouched).
+    r24_doc = installed_core.NotebookDocument.new_notebook()
+    form.document = r24_doc
+    form.file_path = None
+    form._rebuild_cells()
+    app.processEvents()
+    result(form.document.cell_count() == 1
+           and form.document.get_cell(0)["cell_type"] == "code"
+           and form.document.get_cell(0)["source"] == "",
+           "the round-24 pin notebook is a single empty code cell")
+    r24_vbar = form.scrollArea.verticalScrollBar()
+    r24_hbar = form.scrollArea.horizontalScrollBar()
+
+    def _r24_scroll():
+        app.processEvents()
+        return (r24_vbar.value(), r24_hbar.value())
+
+    # The Run button on the empty cell: the click dispatches, nothing
+    # happens -- the kernel stays unstarted, the document stays clean.
+    r24_status_before = form.status_label.text()
+    r24_scroll_before = _r24_scroll()
+    form._on_run_button_clicked(0)
+    result(form.kernel.is_started is False
+           and form.document.is_dirty is False
+           and form.document.cell_count() == 1
+           and form.document.get_cell(0)["execution_count"] is None
+           and form.document.get_cell(0)["outputs"] == []
+           and form._running is False
+           and form.status_label.text() == r24_status_before
+           and _r24_scroll() == r24_scroll_before,
+           "the Run button on an empty code cell is a full no-op (no "
+           "kernel start, not dirty, no count, no outputs, no status "
+           "change, no scroll movement)")
+    # Shift+Enter on the empty cell: the chord's handler runs and refuses
+    # -- no appended cell, no rebuild, the widgets keep their identities.
+    r24_records_before = list(form._cell_widgets)
+    r24_scroll_before = _r24_scroll()
+    form._cell_widgets[0]["editor"].runAdvanceRequested.emit()
+    result(len(form._cell_widgets) == len(r24_records_before)
+           and all(a is b for a, b in
+                   zip(form._cell_widgets, r24_records_before))
+           and form.document.cell_count() == 1
+           and form.document.is_dirty is False
+           and form.kernel.is_started is False
+           and form._current_cell_index == 0
+           and _r24_scroll() == r24_scroll_before,
+           "Shift+Enter on an empty code cell advances NOTHING and "
+           "appends NOTHING (no new cell, no rebuild -- the cell widget "
+           "records kept their identities, scroll unmoved)")
+    # Alt+Enter on the empty cell: no insertion either.
+    r24_scroll_before = _r24_scroll()
+    form._cell_widgets[0]["editor"].runInsertRequested.emit()
+    result(form.document.cell_count() == 1
+           and form.document.is_dirty is False
+           and form.kernel.is_started is False
+           and _r24_scroll() == r24_scroll_before,
+           "Alt+Enter on an empty code cell inserts NOTHING (no new "
+           "cell, scroll unmoved)")
+    # A whitespace-only cell ("  \n\n\t\n") is the same no-op: the guard
+    # reads the STRIPPED source, so blank-looking text is still empty.
+    # Typing itself marks the document dirty (the pre-existing round-9
+    # rule: every real editor edit flags the notebook for the save
+    # prompt), so the pin RESETS the flag after the edit -- the way the
+    # suite's own is_dirty resets work -- to prove the RUN adds no dirt
+    # of its own (no source sync through the empty guard).
+    form._cell_widgets[0]["editor"].setPlainText("  \n\n\t\n")
+    app.processEvents()
+    form.document.is_dirty = False
+    r24_status_before = form.status_label.text()
+    r24_scroll_before = _r24_scroll()
+    form._cell_widgets[0]["editor"].runRequested.emit()
+    result(form.kernel.is_started is False
+           and form.document.is_dirty is False
+           and form.document.cell_count() == 1
+           and form.document.get_cell(0)["execution_count"] is None
+           and form.document.get_cell(0)["source"] == ""
+           and form.status_label.text() == r24_status_before
+           and _r24_scroll() == r24_scroll_before,
+           "a whitespace-only code cell run is the same full no-op (the "
+           "stripped source is empty: no kernel, no sync, the document "
+           "source stays the empty string)")
+    # The all-empties Run All: with NOT ONE non-empty code cell, the Run
+    # All answers honestly and never starts the chain (and never the
+    # kernel).
+    form.on_run_all()
+    app.processEvents()
+    result(form._run_all_active is False
+           and form.kernel.is_started is False
+           and "No non-empty code cells to run." in form.status_label.text(),
+           "Run All over a notebook with no non-empty code cells says so "
+           "and starts nothing ({!r})".format(form.status_label.text()))
 
     # ------------------------------------------------------------------
     print("\n=== (4) the picker dialogs, bridge-fed ===", flush=True)
@@ -3844,6 +3965,180 @@ try:
                 pass
         try:
             example_service.close()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    print("\n=== (9b) round 24: Run All skips the empty code cells, "
+          "executed ===", flush=True)
+
+    # The Run All skip, executed for real over the in-process kernel (the
+    # example section's construction): a notebook of [empty, '1 + 1',
+    # empty, '2 + 2'] runs ONLY the two non-empty cells, in order; the
+    # empty cells stay output-less and count-less, no extra cell is
+    # appended, the chain finishes with the summary status naming only the
+    # cells that ran, and the panel scroll does not move. A second drive
+    # pins the skip INSIDE the chain machinery: starting the chain on the
+    # EMPTY first cell (the _run_cell_at empty guard with run_total set)
+    # hops straight to the next non-empty cell and finishes the chain
+    # honestly. Finally, the unchanged-control sanity: a NON-empty cell's
+    # Shift+Enter still starts the run, appends the fresh cell and focuses
+    # it.
+    r24_service = installed_bridge.NotebookBridgeService(
+        dict(installed_lib.BRIDGE_HANDLERS),
+        pipe_name="dfnb_bridge_round24_tier3",
+        discard_hook=installed_lib.discard_bridge_object)
+    result(r24_service.is_listening,
+           "the round-24 Run All section's bridge service listens on {}"
+           .format(r24_service.pipe_name))
+    r24_form = None
+    try:
+        r24_form = installed_form.DragonflyNotebookForm(
+            pipe_name=r24_service.pipe_name)
+        r24_form.show()
+        app.processEvents()
+        result(r24_form.client.is_connected(),
+               "the round-24 form's bridge client connected")
+        r24_document = installed_core.NotebookDocument.new_notebook()
+        r24_document.add_cell("code", source="1 + 1")
+        r24_document.add_cell("code", source="")
+        r24_document.add_cell("code", source="2 + 2")
+        # cell 0 stays the fresh notebook's own empty code cell
+        r24_form.document = r24_document
+        r24_form.file_path = None
+        r24_form._rebuild_cells()
+        app.processEvents()
+        result(r24_form.document.cell_count() == 4
+               and r24_form.document.get_cell(0)["source"] == ""
+               and r24_form.document.get_cell(1)["source"] == "1 + 1"
+               and r24_form.document.get_cell(2)["source"] == ""
+               and r24_form.document.get_cell(3)["source"] == "2 + 2",
+               "the round-24 Run All fixture is [empty, '1 + 1', empty, "
+               "'2 + 2'] (4 cells)")
+        r24_vbar = r24_form.scrollArea.verticalScrollBar()
+        r24_hbar = r24_form.scrollArea.horizontalScrollBar()
+
+        def _wait_chain_done(label, timeout_s=300.0):
+            # the example section's polling: the chain is asynchronous by
+            # design, so the suite pumps the event loop until the form's
+            # run AND the Run All chain are both done
+            deadline = time.monotonic() + timeout_s
+            while r24_form._running or r24_form._run_all_active:
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        "the round-24 Run All chain did not finish in "
+                        "{} s ({})".format(timeout_s, label))
+                app.processEvents()
+                time.sleep(0.02)
+            for _ in range(5):
+                app.processEvents()
+                time.sleep(0.02)
+
+        scroll_before = (r24_vbar.value(), r24_hbar.value())
+        r24_form.on_run_all()
+        _wait_chain_done("on_run_all")
+        r24_status = r24_form.status_label.text()
+        r24_count_1 = r24_form.document.get_cell(1)["execution_count"]
+        r24_count_3 = r24_form.document.get_cell(3)["execution_count"]
+
+        def _plain(index):
+            # the cell's execute_result payload, read back from the
+            # document (the honest which-code-ran-where evidence)
+            for output in r24_form.document.get_cell(index)["outputs"]:
+                if output.get("output_type") == "execute_result":
+                    return output.get("data", {}).get("text/plain")
+            return None
+
+        # The kernel counter is the in-process shell's SHARED counter
+        # (earlier sections' kernel instances incremented it), so the
+        # exact numbers are not pinnable here -- the ORDER is: the second
+        # executed cell's count is exactly one more than the first's, and
+        # each cell's result names its own source.
+        result(r24_count_1 is not None and r24_count_3 == r24_count_1 + 1
+               and _plain(1) == "2" and _plain(3) == "4",
+               "Run All executed exactly the two non-empty cells IN ORDER "
+               "(counts {} then {} on cells 1 and 3, results '2' and '4' "
+               "-- the second executed cell's count is exactly one more)"
+               .format(r24_count_1, r24_count_3))
+        result(r24_form.document.get_cell(0)["execution_count"] is None
+               and r24_form.document.get_cell(2)["execution_count"] is None
+               and r24_form.document.get_cell(0)["outputs"] == []
+               and r24_form.document.get_cell(2)["outputs"] == [],
+               "the empty cells kept no execution count and no outputs "
+               "through the chain")
+        result(r24_form.document.cell_count() == 4
+               and r24_form._run_all_active is False
+               and "Run All finished (2 code cells)" in r24_status
+               and (r24_vbar.value(), r24_hbar.value()) == scroll_before,
+               "the chain completed with the summary counting only the "
+               "ran cells, no extra cell appended, scroll stable "
+               "({!r})".format(r24_status))
+
+        # The guard's own hop: start the chain ON the empty first cell.
+        # The empty guard refuses the run (False, nothing starts) and the
+        # chain machinery hops to the next non-empty cell, runs the rest
+        # and finishes -- the skipped empty is not counted as run. The
+        # counter anchor is the LAST count the previous chain assigned
+        # (the in-process shell's counter is sequential across every run
+        # of the process, not per cell).
+        count_1_before = r24_form.document.get_cell(1)["execution_count"]
+        count_3_before = r24_form.document.get_cell(3)["execution_count"]
+        last_before = max(count_1_before, count_3_before)
+        r24_form._run_all_active = True
+        r24_form._run_all_total = 2
+        r24_form._run_all_ran = 0
+        result(r24_form._run_cell_at(0, run_total=2) is False,
+               "starting the chain on the EMPTY first cell is refused by "
+               "the empty guard (False, nothing started on the kernel)")
+        _wait_chain_done("the guard hop")
+        r24_status = r24_form.status_label.text()
+        r24_count_1b = r24_form.document.get_cell(1)["execution_count"]
+        r24_count_3b = r24_form.document.get_cell(3)["execution_count"]
+        result(r24_count_1b == last_before + 1
+               and r24_count_3b == r24_count_1b + 1,
+               "the guard's hop ran the non-empty cells in order (the "
+               "chain's last count {} -> {} then {} -- consecutive "
+               "counts, '1 + 1' first)".format(
+                   last_before, r24_count_1b, r24_count_3b))
+        result(r24_form._run_all_ran == 2
+               and r24_form._run_all_active is False
+               and "Run All finished (2 code cells)" in r24_status
+               and r24_form.document.cell_count() == 4
+               and r24_form.document.get_cell(0)["execution_count"] is None
+               and r24_form.document.get_cell(2)["execution_count"] is None,
+               "the skipped empty cell was not counted as run (ran 2) and "
+               "the chain finished with the summary, no extra cell "
+               "({!r})".format(r24_status))
+
+        # The unchanged control: a NON-empty cell's Shift+Enter still
+        # starts the run, and the finish appends the fresh cell and
+        # focuses its editor (the round-8/13 advance, re-pinned once end
+        # to end).
+        sanity_count_before = r24_form.document.cell_count()
+        r24_form._cell_widgets[3]["editor"].setPlainText("3 + 4")
+        result(r24_form._run_cell_at(3, advance=True) is True,
+               "a non-empty cell's Shift+Enter still starts the run")
+        _wait_chain_done("the sanity Shift+Enter")
+        result(r24_form.document.cell_count() == sanity_count_before + 1
+               and r24_form.document.get_cell(4)["cell_type"] == "code"
+               and r24_form.document.get_cell(4)["source"] == ""
+               and r24_form.focusWidget()
+               is r24_form._cell_widgets[4]["editor"],
+               "a non-empty Shift+Enter still appends the fresh cell and "
+               "focuses its editor (cell count {} -> {})".format(
+                   sanity_count_before, r24_form.document.cell_count()))
+    finally:
+        if r24_form is not None:
+            try:
+                r24_form.kernel.stop()
+            except Exception:
+                pass
+            try:
+                r24_form.client.close()
+            except Exception:
+                pass
+        try:
+            r24_service.close()
         except Exception:
             pass
 
