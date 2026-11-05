@@ -2325,7 +2325,12 @@ class DragonflyNotebookForm(QMainWindow):
         # keep today's plain build (they run on the kernel, never render).
         edit_button = None
         if cell['cell_type'] == 'markdown':
-            edit_button = QPushButton('✎ Edit')
+            # Round 23: parented at construction -- the mode flip below
+            # calls setVisible BEFORE the layouts attach to the frame, and
+            # a setVisible(True) on a parentless widget realizes it as a
+            # stray top-level window (one per rendered markdown cell per
+            # load).
+            edit_button = QPushButton('✎ Edit', frame)
             edit_button.setObjectName('markdown_edit_button')
             edit_button.setToolTip('Back to editing')
             edit_button.clicked.connect(
@@ -2333,7 +2338,12 @@ class DragonflyNotebookForm(QMainWindow):
                 self._on_markdown_edit_button_clicked(idx))
             header.addWidget(edit_button)
 
-        editor = NotebookCellEditor()
+        # Round 23: both cell widgets are parented to the frame at
+        # construction -- the markdown branch below flips their visibility
+        # BEFORE body.addWidget parents them, and a setVisible(True) on a
+        # parentless widget realizes it as a stray top-level window (one
+        # per rendered markdown cell flashed on every notebook load).
+        editor = NotebookCellEditor(frame)
         editor.document().setDefaultFont(code_font())
         editor.setPlainText(cell['source'])
         # A dfnb snippet drag onto this editor announces itself; the form
@@ -2355,9 +2365,8 @@ class DragonflyNotebookForm(QMainWindow):
                 self._on_editor_text_changed(ed, hl))
         editor.document().documentLayout().documentSizeChanged.connect(
             lambda _size, ed=editor: self._on_editor_size_changed(ed))
-        QTimer.singleShot(0, lambda ed=editor: ed.resizeToContent())
 
-        browser = QTextBrowser()
+        browser = QTextBrowser(frame)
         browser.setObjectName('cell_output')
         browser.setOpenExternalLinks(False)
         browser.setFont(code_font())
@@ -2479,6 +2488,15 @@ class DragonflyNotebookForm(QMainWindow):
 
         # before the trailing stretch + end-of-list row
         self.cellsLayout.insertWidget(self.cellsLayout.count() - 2, frame)
+        # The grow-with-content pass rides the event loop (the editor takes
+        # its real height one zero-timer after the rebuild). Scheduled only
+        # AFTER the frame is anchored into the form's layout: the round-20
+        # containment path can abort this builder mid-way (a renderer that
+        # raises), and a callback scheduled before the anchoring would then
+        # fire on widgets whose owning frame was already collected -- an
+        # unhandled exception inside a Qt timer callback, which PyQt6
+        # answers with a fatal abort.
+        QTimer.singleShot(0, lambda ed=editor: ed.resizeToContent())
 
         # ONE dispatcher per run button: while THIS cell runs the button is
         # the red Stop affordance (the click sets the stop flag), otherwise

@@ -28,8 +28,11 @@ when the drag carries ONLY local .ipynb URLs (the shared
 ``notebook_drop_policy`` decision), consumes it BEFORE the app's C++
 file-drop dispatcher (which has hardcoded extension lists and no hook a
 plugin could register .ipynb with -- probed round 9) and launches the
-notebook application with the dropped file. The filter is installed when
-the first plugin instance starts and removed when the last one goes.
+notebook application with the dropped file. The filter lives for the
+DRAGONFLY PROCESS: installed at this module's import (the instance
+``__init__`` call is the idempotent fallback for hosts that import the
+glue before any QApplication exists) and never removed until the
+process exits -- the round-9/23 lifetime, see ``_ensure_drop_filter``.
 Every other drag returns False from the filter and hits the platform
 path untouched.
 
@@ -220,9 +223,18 @@ def _launch_notebook_for_path(path):
 
 
 def _ensure_drop_filter():
-    """Installs the application-level .ipynb drop filter when the FIRST
-    plugin instance starts (idempotent). A context without a QApplication
-    (headless hosts) installs nothing: there is no drag to intercept."""
+    """Installs the application-level .ipynb drop filter (idempotent).
+
+    The filter's lifetime is the DRAGONFLY PROCESS (round 23): it is
+    installed once -- at this module's import when a QApplication already
+    exists (the live app's order), or on the first plugin instance's
+    ``__init__`` as the fallback for hosts that imported the glue before
+    any QApplication existed -- and it is NEVER removed until the process
+    exits. The round-9 removal on the last instance's cleanup made a
+    notebook drop work only while a notebook window was already open in
+    the Dragonfly session (with no instance alive, nothing consumed the
+    drag). A context without a QApplication (headless hosts) installs
+    nothing: there is no drag to intercept."""
     global _DROP_FILTER
     if _DROP_FILTER is not None:
         return
@@ -234,20 +246,6 @@ def _ensure_drop_filter():
     app.installEventFilter(_DROP_FILTER)
     log.info('Dragonfly Notebook: .ipynb drop filter installed (drop a '
              'notebook file onto the Dragonfly window to open it).')
-
-
-def _remove_drop_filter():
-    """Removes the application-level filter -- called when the LAST plugin
-    instance goes (see ``DragonflyNotebook.cleanup``; the guard there
-    counts the surviving instances first)."""
-    global _DROP_FILTER
-    if _DROP_FILTER is None:
-        return
-    from PyQt6.QtWidgets import QApplication
-    app = QApplication.instance()
-    if app is not None:
-        app.removeEventFilter(_DROP_FILTER)
-    _DROP_FILTER = None
 
 
 class DragonflyNotebook(OrsPlugin):
@@ -268,9 +266,10 @@ class DragonflyNotebook(OrsPlugin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._child = None
-        # The .ipynb drop filter lives while at least one instance does
-        # (installed on the first instance's start, removed when the last
-        # goes -- see cleanup).
+        # The .ipynb drop filter lives for the Dragonfly PROCESS (installed
+        # at module import; this call is the idempotent fallback for hosts
+        # that imported the glue before any QApplication existed -- round
+        # 23). It is never removed on instance teardown.
         _ensure_drop_filter()
 
     def launch_notebook_app(self, file_path=None):
@@ -313,9 +312,10 @@ class DragonflyNotebook(OrsPlugin):
 
     def cleanup(self):
         """The child app process belongs to this instance: kill it when the
-        plugin goes away (Dragonfly closing); close the bridge -- and
-        remove the application-level .ipynb drop filter -- when the last
-        instance is gone."""
+        plugin goes away (Dragonfly closing); close the bridge when the
+        last instance is gone. The .ipynb drop filter is deliberately NOT
+        touched here -- its lifetime is the Dragonfly process (round 23),
+        so a drop works even with no notebook window open yet."""
         child, self._child = self._child, None
         if child is not None:
             try:
@@ -331,7 +331,6 @@ class DragonflyNotebook(OrsPlugin):
             if not [one for one in type(self).getAllInstances()
                     if one is not self]:
                 close_bridge_service()
-                _remove_drop_filter()
         except Exception:
             pass
         super().cleanup()
@@ -365,3 +364,18 @@ class DragonflyNotebook(OrsPlugin):
                     id_='DragonflyNotebook',
                     section='090_Plugins',
                     action=cls.getActionStringForStartupDefault())
+
+
+# Round 23: the drop filter is installed at IMPORT when a QApplication
+# already exists (the live Dragonfly's order -- the app runs before the
+# plugin manager imports the user plugins), so a notebook drop works from
+# process start, with no notebook window open yet. _ensure_drop_filter
+# no-ops without a QApplication (headless hosts, hosts that import the
+# glue early -- its instance-__init__ call is their fallback), and the
+# guard here must never fail the import.
+try:
+    _ensure_drop_filter()
+except Exception:
+    log.exception('Dragonfly Notebook: the .ipynb drop filter could not '
+                  'be installed at import; the first plugin instance '
+                  'will retry.')

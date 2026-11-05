@@ -101,9 +101,11 @@ plugin manager sees it (namespace package
       drags still accepted), the form-level drop (a valid local .ipynb
       opens, a corrupt one is refused with exactly ONE log entry and the
       notebook untouched, a mixed drag is refused), the drop-filter
-      lifecycle (installed by the first plugin instance, idempotent,
-      removed on demand) and the filter's own consume/pass event contract
-      with a monkeypatched launcher; plus round 21's scroll
+      lifecycle (round 23: the filter's lifetime is the DRAGONFLY
+      PROCESS -- installed by _ensure_drop_filter, idempotent, and the
+      last instance's cleanup leaves it installed so a drop works with
+      no notebook window open yet) and the filter's own consume/pass
+      event contract with a monkeypatched launcher; plus round 21's scroll
       preservation: structural actions (delete, move, insert below,
       append) keep the viewport on the current cell of a 25-cell
       notebook with 40-line STORED OUTPUTS instead of jumping to the
@@ -200,7 +202,19 @@ plugin manager sees it (namespace package
       interpreter deleted between the selection and the click -- no
       exception escapes the pip slot, one status line, exactly one
       'Dragonfly Notebook' log entry naming the OSError, the flag
-      dropped and the button re-enabled).
+      dropped and the button re-enabled);
+  (11) round 23, both window-class fixes pinned at the mechanism: the
+      stray-window pin loads a notebook with RENDERED markdown cells
+      through the real open path under a temporary application-level
+      filter counting Show events delivered to widgets that ARE windows
+      (the old builder flipped the visibility of the still-parentless
+      editor / browser / edit button before the layouts attached them to
+      the cell frame -- one stray top-level window per rendered markdown
+      cell flashed on every load) and asserts a count of ZERO plus every
+      built cell's editor and browser being a child of the form; the
+      drop-filter lifetime pins hold the PROCESS lifetime (install +
+      idempotence through _ensure_drop_filter, and the last instance's
+      real cleanup leaving the filter installed).
 
 ``DFNB_INSTALL_ROOT`` overrides the installed-root probe with one explicit
 data root: the pre-install staging seam. With install=false the suite can
@@ -493,13 +507,14 @@ for name in ("notebook_progress_dialog.py", "functions_dock.py",
 # ---------------------------------------------------------------------------
 print("\n=== (2) the launcher mechanics ===", flush=True)
 
-from PyQt6.QtCore import (QBuffer, QEvent, QEventLoop, QPoint, QPointF,  # noqa: E402
-                          QRect, QMimeData, Qt, QUrl)
+from PyQt6.QtCore import (QBuffer, QEvent, QEventLoop, QObject, QPoint,  # noqa: E402
+                          QPointF, QRect, QMimeData, Qt, QUrl)
 from PyQt6.QtGui import (QDragEnterEvent, QDropEvent, QFontMetrics, QImage,  # noqa: E402
                          QKeyEvent, QMouseEvent)
 from PyQt6.QtWidgets import (QAbstractSlider, QApplication, QCheckBox,  # noqa: E402
                              QDialog, QFrame, QLabel, QMainWindow,
-                             QPushButton, QScrollArea, QTextBrowser)
+                             QPushButton, QScrollArea, QTextBrowser,
+                             QWidget)
 
 from ORSModel import Channel as OrsChannel  # noqa: E402  (fixtures)
 from ORSModel import createChannelFromNumpyArray  # noqa: E402
@@ -542,27 +557,31 @@ result(service is not None and service.is_listening,
 result(service.pipe_name == "dfnb_bridge_{}".format(os.getpid()),
        "the pipe is pid-suffixed: {}".format(service.pipe_name))
 
-# Round 9: the FIRST plugin instance installs the application-level .ipynb
-# drop filter (Explorer drop -> launcher), idempotently; the filter is
-# removed when the last instance goes. This suite runs under dfpy_ors, so
-# the instance construction here is exactly the live first-click path.
+# Round 23: the filter's lifetime is the DRAGONFLY PROCESS. It is
+# installed at glue import when a QApplication already exists (the live
+# app's order -- the GUI runs before the plugin manager imports user
+# plugins); this suite imports the glue BEFORE creating its
+# QApplication, so the import-time install no-ops here and the instance
+# __init__ is the fallback that did the installing. Both paths run the
+# same _ensure_drop_filter: pin the install and its idempotence by
+# resetting the module global and re-running it (any previously
+# installed filter object is removed from the app first, so the reset
+# does not leak a live filter).
+_previous_filter = installed_glue._DROP_FILTER
+if _previous_filter is not None:
+    app.removeEventFilter(_previous_filter)
+installed_glue._DROP_FILTER = None
+result(installed_glue._DROP_FILTER is None,
+       "the drop filter state reset (both install paths share one "
+       "_ensure_drop_filter)")
+installed_glue._ensure_drop_filter()
 drop_filter = installed_glue._DROP_FILTER
 result(drop_filter is not None and isinstance(drop_filter, installed_glue._IpynbDropFilter),
-       "the first plugin instance installed the application-level .ipynb "
+       "_ensure_drop_filter() installs the application-level .ipynb "
        "drop filter")
 installed_glue._ensure_drop_filter()
 result(installed_glue._DROP_FILTER is drop_filter,
        "_ensure_drop_filter() is idempotent (the same filter object stays)")
-installed_glue._remove_drop_filter()
-result(installed_glue._DROP_FILTER is None,
-       "_remove_drop_filter() removed the application-level filter")
-installed_glue._remove_drop_filter()
-result(installed_glue._DROP_FILTER is None,
-       "_remove_drop_filter() with nothing installed stays a no-op")
-installed_glue._ensure_drop_filter()
-result(installed_glue._DROP_FILTER is not None
-       and installed_glue._DROP_FILTER is not drop_filter,
-       "_ensure_drop_filter() re-installs a fresh filter after a removal")
 
 # The spawn the launcher issues, recorded instead of executed (the pin
 # never spawns a real child here -- section 7 does, for real). The glue's
@@ -620,6 +639,19 @@ result(kwargs.get("stdin") == subprocess.DEVNULL
 installed_glue.close_bridge_service()
 result(service.is_listening is False,
        "close_bridge_service() closed the launcher's bridge")
+
+# Round 23: the last instance's teardown must NOT remove the drop filter
+# (the round-9 cleanup block did -- a drop then worked only while a
+# notebook window was already open in the Dragonfly session). The
+# instance runs its REAL cleanup here: it registered no forms (none
+# opened in this suite) and its child handle is None (the stub spawn
+# above never produced a process), so the cleanup is exactly the bridge
+# close -- and the filter must survive it.
+pluginInstance.cleanup()
+result(installed_glue._DROP_FILTER is not None
+       and installed_glue._DROP_FILTER is drop_filter,
+       "the last instance's cleanup leaves the .ipynb drop filter "
+       "installed (the filter's lifetime is the process, not the instance)")
 
 # ---------------------------------------------------------------------------
 print("\n=== (3) the standalone form, headless, over a real bridge ===", flush=True)
@@ -757,6 +789,67 @@ try:
     _hl_result('a leading blank line does not shift the token colors '
                '(loaded from a file)',
                form._cell_widgets[0]["editor"], leading_source)
+
+    # Round 23, pinned at the mechanism: loading a notebook used to flash
+    # one stray top-level window per RENDERED markdown cell -- the builder
+    # flipped the visibility of the still-parentless editor / browser /
+    # edit button BEFORE the layouts attached them to the cell frame, and
+    # a setVisible(True) on a parentless widget realizes it as a real
+    # top-level window (observed live: opening a notebook flashed very
+    # many windows titled like the app, one per rendered markdown cell,
+    # each vanishing immediately). The fix parents the three
+    # widgets to the cell frame at construction. The pin loads a notebook
+    # with RENDERED markdown cells through the real open path under a
+    # temporary application-level filter counting Show events delivered
+    # to widgets that ARE windows; the load must show ZERO of them, and
+    # every built cell's editor and browser must be a child of the form.
+    stray_doc = installed_core.NotebookDocument.new_notebook()
+    for _ in range(3):
+        stray_doc.add_cell('markdown',
+                           source='# rendered heading\n\nsome *markdown* text')
+    stray_doc.add_cell('code', source='1 + 1')
+    stray_doc.remove_cell(0)  # drop new_notebook's empty starter code cell
+    stray_path = os.path.join(temp_dir, "stray_window_probe.ipynb")
+    stray_doc.save(stray_path)
+    stray_doc = installed_core.NotebookDocument.from_file(stray_path)
+
+    stray_show_events = []
+
+    class _StrayWindowCounter(QObject):
+
+        def eventFilter(self, obj, event):
+            if (event.type() == QEvent.Type.Show
+                    and isinstance(obj, QWidget) and obj.isWindow()):
+                stray_show_events.append(obj)
+            return False
+
+    stray_counter = _StrayWindowCounter()
+    app.installEventFilter(stray_counter)
+    try:
+        form._load_notebook_document(stray_doc, stray_path)
+        app.processEvents()
+        app.processEvents()
+    finally:
+        app.removeEventFilter(stray_counter)
+    result(not stray_show_events,
+           "loading a notebook with rendered markdown cells shows ZERO "
+           "stray top-level windows (got {} Show events on widgets that "
+           "are windows)".format(len(stray_show_events)))
+    result(len(form._cell_widgets) == 4 and all(
+        record['editor'].isWindow() is False
+        and record['browser'].isWindow() is False
+        and record['editor'].window() is form
+        and record['browser'].window() is form
+        for record in form._cell_widgets),
+        "every built cell's editor and browser is a child of the form "
+        "(isWindow() False, window() is the form; {} cells)".format(
+            len(form._cell_widgets)))
+    # The probe notebook leaves the form: the highlighter notebook is
+    # loaded again, restoring the exact one-cell state the later
+    # section-3 pins expect.
+    form._load_notebook_document(hl_doc, hl_path)
+    app.processEvents()
+    app.processEvents()
 
     # The toolbar carries the notebook command set (the round-8 tools row
     # is a SECOND row -- the snippet/picker buttons -- not a toolbar
