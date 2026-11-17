@@ -69,7 +69,15 @@ crosses column by column (object-dtyped columns as plain lists, the
 pickle-free fallback) with its index; bytes, scalars, lists and str-keyed
 dicts stay JSON. NOTHING crosses by reference and no pickle is involved,
 which is the other half of the isolation: the venv's numpy and the
-application's numpy never meet, only their bytes.
+application's numpy never meet, only their bytes. There is NO arbitrary
+data-size ceiling here either, but the relay's shape costs at least TWO
+extra full copies of every array (the child's base64 encode and the
+application's decode plus the bridge re-encode), so the npy encoding
+carries a RAM feasibility guard: a payload that cannot fit in memory
+raises a clean, catchable RuntimeError in the cell -- naming the data
+size, the estimated need, the available RAM and the workaround (the
+embedded Dragonfly Python environment, which streams the bridge
+protocol's chunked frames instead) -- and the relay stays alive.
 
 Stop. ``stop`` is handled by the stdin-watcher thread, which owns every
 stdin read: mid-cell it arms a one-shot ``KeyboardInterrupt`` on the
@@ -268,6 +276,78 @@ def _numpy_or_refuse():
     return numpy
 
 
+#: The relay's RAM feasibility constants (module-level, patchable for
+#: tests): the estimated need is the array bytes times
+#: ``_RELAY_RAM_NEED_FACTOR`` plus a fixed working margin. The factor is
+#: 3.5, not the naive 3: the child's real encode peak measured about
+#: 3.33x the array (the npy bytes copy, then base64 inflates by 4/3, and
+#: the JSON line holds the base64 text as one more string), so 3 would
+#: admit transfers the child then dies on; the extra half copy is the
+#: safety slack over the measured peak.
+_RELAY_RAM_NEED_FACTOR = 3.5
+_RELAY_RAM_MARGIN_BYTES = 256 * 1024 * 1024
+
+_RELAY_RAM_MESSAGE = (
+    'dfnb cannot transfer this {} through a custom environment: the '
+    'environment relay carries arrays as base64 JSON lines, which costs '
+    'at least two extra full copies of the data, so a {}-byte array '
+    'needs about {} bytes of free RAM but only {} bytes are available. '
+    'Free memory, switch the notebook environment back to the embedded '
+    'Dragonfly Python (the bridge streams its arrays there without the '
+    'extra copies), or query a smaller selection (one ROI or a MultiROI '
+    'instead of the whole volume).')
+
+
+def _available_memory_bytes():
+    """The physically available RAM in bytes, best effort (the same
+    Windows / POSIX queries the bridge protocol uses); ``None`` when the
+    platform query is unavailable, which makes the guard a no-op."""
+    try:
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ('dwLength', wintypes.DWORD),
+                    ('dwMemoryLoad', wintypes.DWORD),
+                    ('ullTotalPhys', ctypes.c_ulonglong),
+                    ('ullAvailPhys', ctypes.c_ulonglong),
+                    ('ullTotalPageFile', ctypes.c_ulonglong),
+                    ('ullAvailPageFile', ctypes.c_ulonglong),
+                    ('ullTotalVirtual', ctypes.c_ulonglong),
+                    ('ullAvailVirtual', ctypes.c_ulonglong),
+                    ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+                ]
+
+            stat = _MemoryStatusEx()
+            stat.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(
+                    ctypes.byref(stat)):
+                return int(stat.ullAvailPhys)
+            return None
+        return int(os.sysconf('SC_PAGE_SIZE')) * \
+            int(os.sysconf('SC_AVPHYS_PAGES'))
+    except Exception:
+        return None
+
+
+def _check_relay_ram(array_nbytes, what='array'):
+    """The relay's feasibility guard: raises the clean, catchable
+    RuntimeError the CELL sees (the relay itself stays alive) when the
+    array cannot fit through the base64-JSON-line channel. An unknown
+    availability never refuses."""
+    available = _available_memory_bytes()
+    if available is None:
+        return
+    need = int(int(array_nbytes) * _RELAY_RAM_NEED_FACTOR
+               + _RELAY_RAM_MARGIN_BYTES)
+    if need <= available:
+        return
+    raise RuntimeError(_RELAY_RAM_MESSAGE.format(
+        what, int(array_nbytes), need, available))
+
+
 def encode_value(value):
     """One Python value as a JSON-encodable stand-in (the inverse of
     :func:`decode_value`): ndarrays as pickle-free ``numpy.save`` bytes,
@@ -277,6 +357,7 @@ def encode_value(value):
     silently cross the environment boundary."""
     if _is_ndarray(value):
         import numpy
+        _check_relay_ram(value.nbytes, 'array')
         buffer = io.BytesIO()
         try:
             numpy.save(buffer, value, allow_pickle=False)
@@ -321,6 +402,7 @@ def _encode_column(name, series):
         return {'name': name, 'kind': 'json',
                 'values': [encode_value(item) for item in series.tolist()]}
     import numpy
+    _check_relay_ram(array.nbytes, 'column')
     buffer = io.BytesIO()
     numpy.save(buffer, array, allow_pickle=False)
     return {'name': name, 'kind': 'npy',

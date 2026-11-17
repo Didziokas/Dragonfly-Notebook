@@ -18,15 +18,22 @@ process connects as its own client; the service
   timed-out ``waitForReadyRead`` -- probed on the shipped Qt: that moves
   peer bytes into the buffer without running the event loop and without
   delivering queued slots, so no nested handler fires mid-pump),
-* writes its responses CHUNKED (``_WRITE_CHUNK`` bytes per event-loop
-  turn, driven by ``bytesWritten``) so a multi-megabyte publish response
-  never freezes Dragonfly's GUI, and
+* writes its responses through the protocol's chunked frame writer
+  (protocol version 2): a large response streams as bounded frames, and
+  the outbound queue drains synchronously in ``_WRITE_CHUNK`` slices,
+  each pushed with a bounded ``waitForBytesWritten`` (never hung, never
+  dependent on the peer's event-loop pumping), so a multi-gigabyte
+  publish never materializes a full wire copy -- the ACCEPTED COST,
+  documented: such a response streams from the GUI thread itself, so
+  Dragonfly's UI pauses for the transfer's duration (the handler must
+  not pump Qt events from inside the transfer -- the ORS re-entrancy
+  rule), and a payload the RAM feasibility check refuses never reaches
+  the wire: it becomes a normal ``ok:False`` error envelope and the
+  connection stays alive,
 * cleans up on disconnect: queued requests are dropped, and a response
   that could not be delivered has its freshly published object deleted
   again through the discard hook (the glue injects
-  ``dragonflynotebook_lib.discard_bridge_object``).
-
-The service itself is ORS-free: it is constructed with a handler TABLE
+  ``dragonflynotebook_lib.discard_bridge_object``).The service itself is ORS-free: it is constructed with a handler TABLE
 (a dict of method name -> ``handler(params, progress) -> payload``), which
 keeps it unit-testable in the framework-free tier with fake handlers. The
 cancellation path deserves its own note -- it is the round-6 lesson in
@@ -40,16 +47,38 @@ requests additionally run with the handler's event pump stood down
 native progress dialog or pumps events.
 """
 
+import collections
+
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from . import notebook_bridge_protocol as protocol
 
-#: bytes written per event-loop turn: bounded slices keep Dragonfly's GUI
-#: responsive while a multi-megabyte response crosses the pipe.
+#: bytes written per bounded synchronous drain step: bounded slices keep
+#: each individual pipe wait short while a multi-megabyte response crosses.
 _WRITE_CHUNK = 512 * 1024
 
+#: the bound on each ``waitForBytesWritten`` inside the outbound drain: a
+#: peer that stops reading for this long kills the connection instead of
+#: hanging the handler thread forever.
+_WRITE_WAIT_MS = 5000
+
 _HANDSHAKE_TIMEOUT_S = 10.0
+
+
+class _WriteTimeout(Exception):
+    """Raised when a bounded outbound write wait expires (the peer stopped
+    reading); the drain converts it into a clean connection abort."""
+
+
+class _ResponseError(Exception):
+    """The carrier for an ``ok:False`` response whose class name and
+    message travel verbatim (the handler-failure path); raised nowhere,
+    caught by :meth:`_BridgeConnection._send_error_envelope` only."""
+
+    def __init__(self, error_class, message):
+        super().__init__(message)
+        self.error_class = error_class
 
 
 class _BridgeProgress(object):
@@ -103,7 +132,18 @@ class _BridgeConnection(QObject):
         self._busy = False
         self._current_id = None
         self._cancelled = set()     # request ids the app gave up on
-        self._outgoing = bytearray()
+        # the outbound FIFO: ('frame', bytes) for small frames, or
+        # ('stream', iterator) for a chunked transfer whose frames are
+        # pulled one at a time (as segment lists referencing the parts'
+        # own buffers), so a multi-gigabyte response never sits in a
+        # queue as a whole second copy; an oversized in-flight frame
+        # parks its remaining segments in _current_segments/
+        # _current_index/_current_offset, which drain BEFORE the queue
+        # resumes
+        self._out_queue = collections.deque()
+        self._current_segments = None
+        self._current_index = 0
+        self._current_offset = 0
         self._writing = False
         socket.setParent(self)
         socket.readyRead.connect(self._on_ready_read)
@@ -121,6 +161,19 @@ class _BridgeConnection(QObject):
             frames = self._reader.feed(data)
         except ValueError:
             self.abort()  # a corrupted stream cannot recover
+            return
+        except RuntimeError as refusal:
+            # the receiver-side RAM refusal: the reader drained the
+            # announced chunks and the stream is aligned again; a refused
+            # REQUEST gets its normal error envelope, the connection
+            # stays alive
+            header = getattr(refusal, 'header_envelope', None)
+            if isinstance(header, dict) and \
+                    header.get('type') == protocol.REQUEST:
+                self.send_response(int(header.get('id') or 0), False, None,
+                                   'RuntimeError', str(refusal))
+                return
+            self.abort()
             return
         for envelope, parts in frames:
             self._on_frame(envelope, parts)
@@ -211,22 +264,45 @@ class _BridgeConnection(QObject):
 
     def send_response(self, request_id, ok, payload, error_class=None,
                       message=None):
-        """Encodes and queues the response frame; returns False when the
-        peer is already gone (the payload then needs the discard
-        hook). A successful payload is recorded until it has fully
-        drained, so a disconnect can clean it up."""
+        """Encodes and queues the response through the chunked frame
+        writer; returns False when the peer is already gone (the payload
+        then needs the discard hook). A successful payload is recorded
+        until it has fully drained, so a disconnect can clean it up. The
+        send-side RAM feasibility gate runs BEFORE anything is queued: a
+        refusal (or an unencodable payload) becomes a NORMAL
+        ``ok:False`` error envelope, so the client re-raises the clean
+        RuntimeError and the connection stays healthy."""
         parts = []
         if ok:
+            try:
+                marker = protocol.encode_value(payload or {}, parts)
+                protocol.check_parts_feasibility(parts,
+                                                 'the response payload')
+            except (ValueError, RuntimeError) as exc:
+                return self._send_error_envelope(request_id, exc)
             envelope = {'type': protocol.RESPONSE, 'id': request_id,
-                        'ok': True,
-                        'payload': protocol.encode_value(payload or {}, parts)}
+                        'ok': True, 'payload': marker}
             self._service.record_payload(self, payload)
+            self._send_stream(envelope, parts)
+            return self._socket_connected
+        return self._send_error_envelope(
+            request_id, _ResponseError(str(error_class or 'Exception'),
+                                       str(message or '')))
+
+    def _send_error_envelope(self, request_id, exc):
+        """One ``ok:False`` response frame carrying the exception CLASS
+        NAME plus its message. A :class:`_ResponseError` carries its
+        class name verbatim (the handler-failure path, unchanged); a
+        ValueError / RuntimeError keeps its class (the RAM refusal's
+        clean RuntimeError must survive the trip as a RuntimeError);
+        anything else travels under its own class name."""
+        if isinstance(exc, _ResponseError):
+            error_class = exc.error_class
         else:
-            envelope = {'type': protocol.RESPONSE, 'id': request_id,
-                        'ok': False,
-                        'error_class': str(error_class or 'Exception'),
-                        'message': str(message or '')}
-        self._send_raw(protocol.encode_frame(envelope, parts))
+            error_class = type(exc).__name__
+        self._send_raw(protocol.encode_frame(
+            {'type': protocol.RESPONSE, 'id': request_id, 'ok': False,
+             'error_class': error_class, 'message': str(exc)}))
         return self._socket_connected
 
     # -- progress + cancellation ----------------------------------------------
@@ -273,26 +349,133 @@ class _BridgeConnection(QObject):
 
     @property
     def _socket_connected(self):
-        return self._socket.state() == \
-            QLocalSocket.LocalSocketState.ConnectedState
+        # None-safe: every send path reports this after the fact, and an
+        # aborted connection (self._socket is None) is simply "not
+        # connected" -- raising here would send an AttributeError up the
+        # Qt slot the send was called from
+        socket = self._socket
+        return socket is not None and \
+            socket.state() == QLocalSocket.LocalSocketState.ConnectedState
 
     # -- outbound (chunked) ----------------------------------------------------
 
     def _send_raw(self, frame):
-        self._outgoing.extend(frame)
+        self._out_queue.append(('frame', frame))
+        self._flush_outgoing()
+
+    def _send_stream(self, envelope, parts=None):
+        """Queues one logical message's chunked frame sequence: the frames
+        are PULLED one at a time, as SEGMENT LISTS whose bytes reference
+        the parts' own buffers, so a multi-gigabyte response streams
+        without ever existing as a second whole-wire copy."""
+        self._out_queue.append(('stream',
+                                protocol.iter_frame_segments(envelope,
+                                                             parts)))
         self._flush_outgoing()
 
     def _flush_outgoing(self):
-        if self._writing or not self._outgoing:
+        """Drains the whole outbound FIFO synchronously, in bounded
+        ``_WRITE_CHUNK`` slices, each pushed to the OS pipe with a bounded
+        ``waitForBytesWritten``. This deliberately does NOT depend on the
+        peer's event loop delivering ``bytesWritten``: a reader that sits
+        inside ``waitForReadyRead`` would otherwise advance the stream at
+        one slice per lucky pump (the round-25 hang). The cost is that the
+        handler thread stays inside this drain until the response is out,
+        which is the documented GUI pause for large transfers."""
+        if self._writing or self._socket is None:
             return
-        chunk = bytes(self._outgoing[:_WRITE_CHUNK])
-        del self._outgoing[:len(chunk)]
         self._writing = True
-        self._socket.write(chunk)
+        try:
+            while self._socket is not None:
+                # the parked remainder of an oversized in-flight frame
+                # drains FIRST (the queue resumes only after the whole
+                # frame is out)
+                if self._current_segments is not None:
+                    segments = self._current_segments
+                    index = self._current_index
+                    offset = self._current_offset
+                    segment = segments[index]
+                    piece = segment[offset:offset + _WRITE_CHUNK]
+                    offset += len(piece)
+                    if offset >= len(segment):
+                        index += 1
+                        offset = 0
+                        if index >= len(segments):
+                            self._current_segments = None
+                            self._current_index = 0
+                            self._current_offset = 0
+                    self._current_index = index
+                    self._current_offset = offset
+                    self._start_write(piece)
+                    continue
+                if not self._out_queue:
+                    break
+                kind, item = self._out_queue[0]
+                if kind == 'stream':
+                    # the generator stays queued until it is exhausted:
+                    # each pulled frame is written, then the NEXT pull
+                    # resumes the same stream
+                    segments = next(item, None)
+                    if segments is None:
+                        self._out_queue.popleft()
+                        continue
+                else:
+                    segments = [item]
+                    self._out_queue.popleft()
+                total = sum(len(segment) for segment in segments)
+                if total <= _WRITE_CHUNK:
+                    for segment in segments:
+                        self._start_write(segment)
+                    continue
+                # bounded slices keep the handler's pause granular; the
+                # frame's remainder parks outside the queue (which still
+                # holds the stream, if this frame came from one)
+                self._current_segments = segments
+                self._current_index = 0
+                self._current_offset = 0
+        except _WriteTimeout:
+            # the peer stopped reading for a whole wait window: drop the
+            # connection cleanly (the teardown discards the recorded
+            # payload) rather than hanging the handler thread forever
+            self.abort()
+        except Exception:
+            # defensive: NOTHING raised by the writer (a stream pull
+            # gone wrong, the writer's own mismatch self-check, an
+            # unexpected encoding error mid-transfer) may ever reach the
+            # Qt slot it was called from -- that aborts the process. The
+            # stream is mid-flight, so an error envelope cannot repair
+            # it; the clean outcome is a connection abort, whose
+            # teardown discards the recorded payload.
+            self.abort()
+        finally:
+            self._writing = False
+        # The bounded waits consume the write completions themselves
+        # (probed: bytesWritten fires INSIDE waitForBytesWritten, and a
+        # response that finishes inside a synchronous drain leaves NO
+        # completion for the event loop to deliver later), so
+        # _on_bytes_written's clear_payload would never run for such a
+        # response and the recorded publish payload would be held until
+        # disconnect. Clear it here when the drain ended with a fully
+        # empty socket.
+        if self._socket is not None and not self._out_queue \
+                and self._current_segments is None \
+                and self._socket.bytesToWrite() == 0:
+            self._service.clear_payload(self)
+
+    def _start_write(self, piece):
+        self._socket.write(bytes(piece))
+        # a re-entrant handler during the bounded wait may abort() (the
+        # socket goes away); the drain loop notices and stops cleanly
+        while self._socket is not None and self._socket.bytesToWrite() > 0:
+            if not self._socket.waitForBytesWritten(_WRITE_WAIT_MS):
+                raise _WriteTimeout(
+                    'dfnb bridge write stalled for {} ms'.format(
+                        _WRITE_WAIT_MS))
 
     def _on_bytes_written(self, _count):
-        self._writing = False
-        if self._outgoing:
+        if self._writing:
+            return  # the synchronous drain in _flush_outgoing owns the flow
+        if self._out_queue or self._current_segments is not None:
             self._flush_outgoing()
         else:
             # everything encoded has drained to the peer: the payload is
@@ -310,7 +493,11 @@ class _BridgeConnection(QObject):
         through the discard hook -- disconnect cleanup."""
         self._cancelled.clear()
         self._pending = []
-        self._outgoing = bytearray()
+        self._out_queue.clear()
+        self._current_segments = None
+        self._current_index = 0
+        self._current_offset = 0
+        self._writing = False
         recorded = self._service.take_payload(self)
         if recorded is not None:
             self._service.discard_payload(recorded)

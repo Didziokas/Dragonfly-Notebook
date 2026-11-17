@@ -51,9 +51,14 @@ modules import no ORS code and no Dragonfly module):
     dicts, numpy arrays npy-encoded, bytes, pandas DataFrames as column/
     index parts with an object-dtype JSON fallback), the refusals (a set,
     a dict carrying the reserved ``__dfnb__`` key, a pickled-object
-    array), the frame layout (8-byte little-endian length prefix, 4-byte
-    JSON length), chunked FrameReader delivery at arbitrary boundaries,
-    the oversize guard, and the PID-suffixed pipe name;
+    array), the round-25 wire format (protocol version 2: a header frame
+    declaring every part's kind and byte count, then exactly
+    ceil(total/CHUNK_BYTES) chunk frames; lazy npy parts that stream from
+    the array's own buffer; the reader hands out ALREADY-DECODED arrays),
+    chunked FrameReader delivery at arbitrary boundaries, the wire-frame
+    guard (a corrupted length prefix fails fast, while a LOGICAL payload
+    over the old 1 GiB ceiling streams fine in bounded chunks), and the
+    PID-suffixed pipe name;
   * the dfnb client (``dfnb_client``) against a FAKE in-process protocol
     server (real frames, real encode/decode, no QLocalServer, no ORS --
     that is what tier 2's loopback is for): the version handshake (a
@@ -84,6 +89,20 @@ Cells actually RUNNING on an environment's interpreter (spawn, relay,
 stop, restart, switch) are the kernel smoke's environment pins; the
 REAL venv creation, a real OFFLINE pip install and the form-side UI
 rules are tier 3's section 10.
+
+Round 25 replaces the old 1 GiB frame ceiling with the always-chunked
+frame writer and the RAM feasibility gate: a ~2 MiB array and a
+DataFrame round-trip through the chunked frames at a patched 64 KiB
+chunk size, a 1.25 GiB memmap payload streams in bounded chunks with no
+refusal and no full materialization, and ``check_ram_feasibility``
+refuses a payload that cannot fit in memory with the clean, catchable
+RuntimeError while the margin and availability are monkeypatchable. The
+round-25 review hardening is pinned too: an npy header split at exactly
+8 or 9 bytes buffers cleanly (the struct.error that escaped the
+corruption handlers is mapped), a zero-length payload prefix raises the
+clean truncation ValueError, datetime64/timedelta64 arrays are refused
+at encode time with the remedy named, and the writer and reader agree
+on the inline envelope cap.
 
 Run (tier 1 is framework-free: straight on the embedded interpreter, no
 dfpy_ors launcher needed):
@@ -926,76 +945,565 @@ def case_protocol_value_rejections_pinned():
 
 
 def case_protocol_frame_layout_and_chunked_reader_pins():
-    """The wire format, pinned byte-for-byte: an 8-byte little-endian
-    length prefix counting the REST of the frame, a 4-byte JSON length,
-    JSON first then the blob parts; the FrameReader reassembles frames fed
-    at arbitrary chunk boundaries (two frames back to back; a large
-    frame's blob chunked at 777 bytes); the oversize guard refuses a
-    lying length prefix; a truncated blob is a ValueError."""
-    parts = []
+    """The round-25 wire format (protocol version 2), pinned
+    byte-for-byte: every logical message is an ordered frame sequence,
+    each frame an 8-byte little-endian length prefix counting the REST of
+    the frame, a 4-byte JSON length, JSON first then the frame's raw data
+    area; the message's FIRST frame is the header (its envelope carries
+    the declared blob_parts as {'kind', 'bytes'} entries, its data area
+    is empty) and exactly ceil(total/CHUNK_BYTES) chunk frames follow,
+    ZERO when there are no binary parts (a small message is a lone header
+    frame -- uniform beats special cases); the reader reassembles frames
+    fed at arbitrary chunk boundaries and hands out the message's
+    envelope with ALREADY-DECODED npy parts; the wire-frame guard refuses
+    a lying length prefix fast (one frame never exceeds one chunk plus
+    framing overhead plus the inline envelope slack -- the guard bounds a
+    FRAME, never a transfer, and the writer's envelope cap sits inside
+    it), and a chunk frame with no open transfer is a ValueError."""
     envelope = {'type': 'request', 'id': 7, 'method': 'echo',
                 'params': {'a': 1}}
-    frame = protocol.encode_frame(envelope, parts)
+    frame = protocol.encode_frame(envelope)
     total = struct.unpack('<Q', frame[:8])[0]
     assert total == len(frame) - 8, \
         "the 8-byte prefix counts the rest of the frame, got {}".format(total)
     json_len = struct.unpack('<I', frame[8:12])[0]
-    assert json.loads(frame[12:12 + json_len].decode('utf-8'))['type'] == \
-        'request', "the JSON envelope follows the JSON length"
-    assert json_len + 12 == len(frame), "no blob parts -> nothing after JSON"
+    header_envelope = json.loads(frame[12:12 + json_len].decode('utf-8'))
+    assert header_envelope['type'] == 'request', \
+        "the JSON envelope follows the JSON length"
+    assert header_envelope['blob_parts'] == [], \
+        "a message without binary parts declares zero parts"
+    assert json_len + 12 == len(frame), \
+        "a lone header frame: the header is the whole message"
 
-    # a frame WITH a blob part: the array rides after the JSON
+    # a message WITH a binary part: the header declares it, one chunk
+    # frame carries it (300000 bytes fit one default 8 MiB chunk)
     parts = []
-    payload = protocol.encode_value({'array': np.arange(300000)},
-                                    parts)
+    marker = protocol.encode_value({'array': np.arange(300000)}, parts)
     framed = protocol.encode_frame({'type': 'response', 'id': 1, 'ok': True,
-                                    'payload': payload}, parts)
-    assert len(framed) > 300000, "the blob is inside the frame"
+                                    'payload': marker}, parts)
+    first_payload_len = struct.unpack('<Q', framed[:8])[0]
+    first_json_len = struct.unpack('<I', framed[8:12])[0]
+    declared = json.loads(
+        framed[12:12 + first_json_len].decode('utf-8'))['blob_parts']
+    npy_bytes = declared[0]['bytes']
+    assert declared[0]['kind'] == 'npy', "the header declares the part kind"
+    header_frame_len = 8 + first_payload_len
+    rest = framed[header_frame_len:]
+    rest_payload = struct.unpack('<Q', rest[:8])[0]
+    rest_json_len = struct.unpack('<I', rest[8:12])[0]
+    assert json.loads(rest[12:12 + rest_json_len].decode('utf-8')) == \
+        {'type': protocol.CHUNK}, \
+        "the frame after the header is a chunk frame"
+    assert rest_payload - 4 - rest_json_len == npy_bytes, \
+        "the chunk frame carries exactly the declared data bytes"
+    assert len(framed) == header_frame_len + 8 + rest_payload, \
+        "the header frame is followed by exactly one chunk frame"
 
+    # the reader: arbitrary boundaries, two messages back to back, the
+    # npy part arrives ALREADY DECODED
     reader = protocol.FrameReader()
     got = []
-    data = framed + protocol.encode_frame(envelope, [])
+    data = framed + protocol.encode_frame(envelope)
     for start in range(0, len(data), 777):
         got.extend(reader.feed(data[start:start + 777]))
-    assert len(got) == 2, "two frames back to back, chunked at 777"
+    assert len(got) == 2, "two messages back to back, chunked at 777"
     assert got[0][0]['type'] == 'response' and got[0][0]['id'] == 1
-    assert got[1][0] == envelope, "the second frame decodes exactly"
+    assert got[1][0] == envelope, "the second message decodes exactly"
+    assert got[0][1][0][0] == 'npy', "the part rides as ('npy', value)"
     decoded = protocol.decode_value(got[0][0]['payload'], got[0][1])
     assert np.array_equal(decoded['array'], np.arange(300000)), \
-        "the large blob survives the chunked delivery"
+        "the array survives the chunked delivery, already decoded"
 
+    # the wire-frame guard: a lying length prefix beyond one chunk plus
+    # the framing slack plus the inline envelope slack fails fast (this
+    # bounds a FRAME, not a transfer; the envelope slack is part of the
+    # guard so the writer's inline envelopes are always accepted)
     reader = protocol.FrameReader()
     try:
-        reader.feed(struct.pack('<Q', protocol.MAX_FRAME_BYTES + 1))
+        reader.feed(struct.pack('<Q', protocol._frame_guard_bytes() + 1))
         raise AssertionError("a lying length prefix must be refused")
     except ValueError:
         pass
+    # and the guard's own composition: exactly the guard-sized prefix is
+    # accepted up to the guard (the writer's cap sits inside it)
+    assert protocol._frame_guard_bytes() == (
+        protocol.CHUNK_BYTES + protocol.FRAME_SLACK_BYTES +
+        protocol._ENVELOPE_SLACK_BYTES)
 
-    parts = []
-    payload = protocol.encode_value({'array': np.ones(64, np.uint8)}, parts)
-    framed = protocol.encode_frame({'type': 'response', 'id': 2, 'ok': True,
-                                    'payload': payload}, parts)
+    # a chunk frame with no open transfer: a ValueError, not silence
+    reader = protocol.FrameReader()
+    lone_chunk = b''.join(protocol._frame_segments(
+        {'type': protocol.CHUNK}, b'\x00\x01\x02'))
     try:
-        protocol.decode_payload(framed[:-5])
-        raise AssertionError("a truncated blob must be refused")
+        reader.feed(lone_chunk)
+        raise AssertionError("a chunk frame with no header must be refused")
     except ValueError:
         pass
-    print("  protocol frames: 8-byte LE prefix + 4-byte JSON length pinned, "
-          "chunked reassembly (2 frames, 300k blob @777), oversize + "
-          "truncation refused")
+
+    # a truncated JSON envelope is a ValueError
+    parts = []
+    marker = protocol.encode_value({'array': np.ones(64, np.uint8)}, parts)
+    framed = protocol.encode_frame({'type': 'response', 'id': 2, 'ok': True,
+                                    'payload': marker}, parts)
+    header_frame_len = 8 + struct.unpack('<Q', framed[:8])[0]
+    try:
+        protocol._decode_frame_payload(
+            framed[8:header_frame_len][:-5])
+        raise AssertionError("a truncated frame payload must be refused")
+    except ValueError:
+        pass
+    print("  protocol frames: v2 header + chunk frames pinned (declared "
+          "kind/bytes, lone header for small messages), reassembly at "
+          "arbitrary boundaries, decoded npy parts, wire-frame guard + "
+          "orphan chunk + truncation refused")
+
+
+def case_protocol_chunked_large_array_roundtrip_pins():
+    """Pin (a): a ~2 MiB array round-trips encode_value -> the frame
+    writer -> the reader with CHUNK_BYTES monkeypatched to 64 KiB: exact
+    dtype, shape and values, many chunk frames, and the reader tolerates
+    arbitrary feed slicing."""
+    original_chunk = protocol.CHUNK_BYTES
+    protocol.CHUNK_BYTES = 65536
+    try:
+        array = (np.arange(512 * 1024, dtype=np.uint32) % 251) \
+            .reshape(512, 1024)
+        parts = []
+        marker = protocol.encode_value({'a': array, 'name': 'big'}, parts)
+        frames = list(protocol.iter_frames(
+            {'type': 'response', 'id': 1, 'ok': True, 'payload': marker},
+            parts))
+        chunk_frames = 0
+        for frame in frames[1:]:
+            envelope, _data = protocol._decode_frame_payload(frame[8:])
+            assert envelope == {'type': protocol.CHUNK}, \
+                "every frame after the header is a chunk frame"
+            chunk_frames += 1
+        assert chunk_frames >= 30, \
+            "a 2 MiB payload at 64 KiB chunks is many frames, got " \
+            "{}".format(chunk_frames)
+        blob = b''.join(frames)
+        reader = protocol.FrameReader()
+        got = []
+        for start in range(0, len(blob), 3333):
+            got.extend(reader.feed(blob[start:start + 3333]))
+        assert len(got) == 1, "the chunked message reassembles whole"
+        envelope, frame_parts = got[0]
+        assert envelope['id'] == 1
+        result = protocol.decode_value(envelope['payload'], frame_parts)
+        assert result['name'] == 'big'
+        assert result['a'].dtype == np.uint32 \
+            and result['a'].shape == (512, 1024), \
+            "the exact dtype and shape survive"
+        assert np.array_equal(result['a'], array), \
+            "the exact values survive"
+    finally:
+        protocol.CHUNK_BYTES = original_chunk
+    print("  chunked round trip: 2 MiB uint32 array at 64 KiB chunks, "
+          "exact dtype/shape/values, arbitrary feed slicing")
+
+
+def case_protocol_dataframe_chunked_roundtrip_pins():
+    """Pin (b): a DataFrame with numeric, object-dtyped and boolean
+    columns plus a non-default index round-trips through the chunked
+    frames unchanged (column names, dtypes, values, index)."""
+    original_chunk = protocol.CHUNK_BYTES
+    protocol.CHUNK_BYTES = 65536
+    try:
+        table = pd.DataFrame({'count': [1.0, 2.0, 3.0],
+                              'name': ['a', 'b', 'c'],
+                              'flag': np.array([True, False, True])},
+                             index=[10, 20, 30])
+        parts = []
+        marker = protocol.encode_value(table, parts)
+        blob = protocol.encode_frame({'type': 'response', 'id': 2,
+                                      'ok': True, 'payload': marker}, parts)
+        reader = protocol.FrameReader()
+        got = reader.feed(blob)
+        assert len(got) == 1, "the chunked message reassembles whole"
+        envelope, frame_parts = got[0]
+        result = protocol.decode_value(envelope['payload'], frame_parts)
+        assert isinstance(result, pd.DataFrame), \
+            "a DataFrame comes back a DataFrame"
+        assert list(result.columns) == ['count', 'name', 'flag'], \
+            "column names and order survive"
+        assert result['name'].dtype == object, \
+            "the object column survives its dtype"
+        assert result.equals(table), "values and index survive exactly"
+    finally:
+        protocol.CHUNK_BYTES = original_chunk
+    print("  DataFrame round trip: numeric + object + bool columns and "
+          "the index survive the chunked frames unchanged")
+
+
+def case_protocol_transfer_over_old_ceiling_streams_pins():
+    """Pin (c): the old 1 GiB frame ceiling is GONE. A LOGICAL payload
+    over 1 GiB (a 1.25 GiB numpy memmap over a temp file) streams through
+    the frame writer in bounded chunks with no refusal and no full
+    materialization (the memmap is file-backed, so a whole-payload
+    serialization would show up as a 1.25 GiB bytes copy this writer
+    never makes); the frame count is exactly ceil(total/CHUNK_BYTES) and
+    the streamed data bytes equal the declared total. Runtime stays
+    bounded and the temp file is deleted in finally."""
+    payload_bytes = 1288490188  # 1.25 GiB of uint8, above the old 1 << 30
+    handle, path = tempfile.mkstemp(prefix='dfnb_r25_ceiling_')
+    os.close(handle)
+    # extend the file to its full size first: a read-mode memmap maps a
+    # fixed window, and Windows refuses to map past a file's end
+    with open(path, 'wb') as extend:
+        extend.seek(payload_bytes - 1)
+        extend.write(b'\x00')
+    started = time.monotonic()
+    try:
+        array = np.memmap(path, dtype=np.uint8, mode='r',
+                          shape=(payload_bytes,))
+        parts = [('npy', array)]
+        frames = protocol.iter_frames({'type': 'response', 'id': 3,
+                                       'ok': True}, parts)
+        header = next(frames)
+        json_len = struct.unpack('<I', header[8:12])[0]
+        declared = json.loads(
+            header[12:12 + json_len].decode('utf-8'))['blob_parts']
+        npy_bytes = declared[0]['bytes']
+        assert npy_bytes > (1 << 30), \
+            "the declared logical payload ({}) is over the old 1 GiB " \
+            "ceiling".format(npy_bytes)
+        chunk_frames = 0
+        data_bytes = 0
+        for frame in frames:
+            chunk_frames += 1
+            frame_payload = struct.unpack('<Q', frame[:8])[0]
+            frame_json = struct.unpack('<I', frame[8:12])[0]
+            data_bytes += frame_payload - 4 - frame_json
+        expected_chunks = -(-npy_bytes // protocol.CHUNK_BYTES)
+        assert chunk_frames == expected_chunks, \
+            "exactly ceil(total/CHUNK_BYTES) chunk frames, got {} vs " \
+            "{}".format(chunk_frames, expected_chunks)
+        assert data_bytes == npy_bytes, \
+            "the streamed data bytes equal the declared total"
+        assert all(struct.unpack('<Q', frame[:8])[0] <=
+                   protocol.CHUNK_BYTES + protocol.FRAME_SLACK_BYTES
+                   for frame in [header]), "the header frame is small"
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    elapsed = time.monotonic() - started
+    assert elapsed < 60.0, \
+        "the 1.25 GiB stream must stay bounded, took {:.1f} s".format(
+            elapsed)
+    print("  ceiling gone: a 1.25 GiB memmap payload streams in {} "
+          "bounded chunk frames with no refusal and no full copy "
+          "({:.1f} s)".format(expected_chunks, elapsed))
+
+
+def case_protocol_ram_feasibility_gate_pins():
+    """Pin (d): the RAM feasibility check. ``available_memory_bytes``
+    reports a real byte count on this platform; ``check_ram_feasibility``
+    with a patched-small availability raises the clean RuntimeError
+    naming the size, the need and the available RAM and what to do, and
+    passes with a patched-large one; the margin constant is module-level
+    and honored; the parts-level send-side gate refuses the same way."""
+    available = protocol.available_memory_bytes()
+    assert isinstance(available, int) and available > 0, \
+        "the platform query reports the available RAM, got {!r}".format(
+            available)
+
+    original_available = protocol.available_memory_bytes
+    original_margin = protocol.RAM_CHECK_MARGIN_BYTES
+    protocol.RAM_CHECK_MARGIN_BYTES = 1 << 20
+    try:
+        protocol.available_memory_bytes = lambda: 1 << 20
+        try:
+            protocol.check_ram_feasibility(4096, 'the test transfer')
+            raise AssertionError("a payload beyond the RAM must be refused")
+        except RuntimeError as exc:
+            message = str(exc)
+            assert 'does not fit in memory' in message, message
+            assert '4096 bytes' in message, message
+            assert 'bytes of free RAM' in message, message
+            assert 'bytes are available' in message, message
+            assert 'one ROI or a MultiROI' in message, message
+        protocol.available_memory_bytes = lambda: (1 << 20) + 8192
+        protocol.check_ram_feasibility(4096, 'the test transfer')
+
+        # the send-side parts gate: an npy part's bytes are counted
+        array = np.zeros(1024, np.float32)
+        protocol.available_memory_bytes = lambda: 1 << 20
+        try:
+            protocol.check_parts_feasibility([('npy', array)],
+                                             'the test transfer')
+            raise AssertionError("the parts gate must refuse")
+        except RuntimeError:
+            pass
+        protocol.available_memory_bytes = lambda: (1 << 30)
+        protocol.check_parts_feasibility([('npy', array)],
+                                         'the test transfer')
+        # an unknown availability never refuses
+        protocol.available_memory_bytes = lambda: None
+        protocol.check_ram_feasibility(1 << 40, 'the test transfer')
+    finally:
+        protocol.available_memory_bytes = original_available
+        protocol.RAM_CHECK_MARGIN_BYTES = original_margin
+    print("  RAM gate: real availability reported, patched-small refuses "
+          "with the clean message, patched-large passes, unknown never "
+          "refuses, the parts-level send gate matches")
+
+
+def case_protocol_v25_p1_hardening_pins():
+    """The round-25 review's hardening, framework-free: an npy header
+    split at exactly 8 or 9 bytes is a clean need-more-data (never the
+    struct.error that escaped the corruption handlers on both ends), a
+    zero-length payload prefix is the clean truncation ValueError,
+    datetime64/timedelta64 arrays are refused at ENCODE time with the
+    remedy named (before anything is written, connection untouched), and
+    the writer and reader agree on the inline envelope cap: a ~10 MiB
+    envelope round-trips where the old 9 MiB guard would have called it
+    corruption, and one beyond the cap raises the clean ValueError."""
+    # P1-a: the (1,0) header-length unpack needs 10 bytes; a buffer of
+    # exactly 8 or 9 must buffer, not raise struct.error
+    array = np.arange(5, dtype=np.float64)
+    npy = protocol._npy_header_bytes(array) + array.tobytes()
+    declared = [{'kind': 'npy', 'bytes': len(npy)}]
+    for cut in (8, 9):
+        assembler = protocol._PartAssembler({'type': 'r'}, declared)
+        assert assembler.feed(npy[:cut]) is False, \
+            "a {}-byte npy header cut must buffer cleanly".format(cut)
+    # and the two-feed completion still lands the exact array
+    assembler = protocol._PartAssembler({'type': 'r'}, declared)
+    assert assembler.feed(npy[:8]) is False
+    assert assembler.feed(npy[8:]) is True
+    values = assembler.finish()
+    assert np.array_equal(values[0], array)
+    print("  npy header cuts 8/9: clean need-more-data, never "
+          "struct.error (the escape that reached the Qt slot)")
+
+    # P2-3: a zero-length payload prefix is the clean truncation
+    # ValueError, not a struct.error from unpacking an empty buffer
+    reader = protocol.FrameReader()
+    try:
+        reader.feed((0).to_bytes(8, 'little'))
+        raise AssertionError("a zero-length payload must be refused")
+    except ValueError as exc:
+        assert 'bridge frame payload is truncated' in str(exc), str(exc)
+    print("  zero-length payload prefix: the clean truncation ValueError")
+
+    # P1-b: memoryview-incompatible dtypes refused at ENCODE time
+    for value in (np.array(['2020-01-01', '2021-01-01'],
+                           dtype='datetime64[D]'),
+                  np.array([1, 2], dtype='timedelta64[s]')):
+        parts = []
+        try:
+            protocol.encode_value({'v': value}, parts)
+            raise AssertionError(
+                "a {} array must be refused at encode".format(value.dtype))
+        except ValueError as exc:
+            message = str(exc)
+            assert 'dfnb could not transfer an array of dtype' in message
+            assert 'datetime' in message, message
+            assert 'convert' in message, message
+        assert parts == [], "the refusal wrote no parts"
+    # a DataFrame with a datetime column refuses through the same gate
+    table = pd.DataFrame({'when': np.array(
+        ['2020-01-01', '2021-01-01'], dtype='datetime64[D]')})
+    parts = []
+    try:
+        protocol.encode_value(table, parts)
+        raise AssertionError("a datetime column must be refused at encode")
+    except ValueError as exc:
+        assert 'datetime' in str(exc), str(exc)
+    assert parts == [], "the refusal wrote no parts"
+    print("  datetime64/timedelta64 (plain and as a DataFrame column): "
+          "the clean encode-time ValueError naming dtype and remedy")
+
+    # P2-1: writer/reader agreement on the inline envelope cap
+    big_text = 'x' * (10 * 1024 * 1024)
+    envelope = {'type': 'response', 'id': 1, 'ok': True,
+                'payload': big_text}
+    blob = protocol.encode_frame(envelope)
+    got = protocol.FrameReader().feed(blob)
+    assert got[0][0]['payload'] == big_text
+    assert 8 < len(blob) and len(blob) > 10 * 1024 * 1024
+    # beyond the cap: the clean writer-side ValueError
+    try:
+        protocol.encode_frame({'type': 'response', 'id': 2, 'ok': True,
+                               'payload': 'x' * (
+                                   protocol._ENVELOPE_SLACK_BYTES + 1)})
+        raise AssertionError("an over-cap envelope must be refused")
+    except ValueError as exc:
+        assert 'inline envelope cap' in str(exc), str(exc)
+    print("  envelope cap agreement: a 10 MiB inline envelope round-"
+          "trips (beyond the old 9 MiB guard), an over-cap envelope "
+          "raises the clean ValueError")
+
+
+def case_protocol_r25_attacker_fix_pins():
+    """The round-25 attacker round's four confirmed defects, pinned
+    framework-free: a corrupt npy chunk surfaces as the ONE clean
+    ValueError (never the BufferError that escaped the Qt slot and
+    killed real service processes) with no dangling buffer exports;
+    F-order / strided / zero-size arrays transfer (the contiguous copy
+    happens BEFORE the buffer view is attempted and is accounted by the
+    RAM gate); a zero-length bytes part round-trips and a marker that
+    references a missing part is the clean ValueError (never a raw
+    IndexError); a raw json.JSONDecodeError becomes the clean 'bridge
+    frame JSON is invalid' ValueError."""
+    import json as _json
+
+    def framed(envelope_json, data=b''):
+        return (len(envelope_json) + 4 + len(data)).to_bytes(8, 'little') \
+            + len(envelope_json).to_bytes(4, 'little') + envelope_json + data
+
+    # DEFECT 1: a valid header + a chunk of npy garbage; the corruption
+    # ValueError is raised while memoryview slices of the reader's own
+    # buffer are alive in the traceback frames -- the trim must not turn
+    # it into a BufferError, and the reader must be reusable afterwards
+    for label, declared_bytes, chunk_data in (
+            ('bad-magic', 64, b'\x00' * 64),
+            ('declared-vs-npy-size-mismatch', None, None)):
+        array = np.arange(100, dtype=np.int32)
+        npy = protocol._npy_header_bytes(array) + array.tobytes()
+        if label == 'bad-magic':
+            chunk = chunk_data
+        else:
+            # a valid npy whose data area is SHORTER than the transfer
+            # header declared (the header's own lie)
+            npy = npy + b'\x00' * 8
+            chunk = npy
+            declared_bytes = len(npy) + 500
+        envelope = {'type': 'request', 'id': 1, 'method': 'echo',
+                    'params': 1,
+                    'blob_parts': [{'kind': 'npy',
+                                    'bytes': declared_bytes}]}
+        blob = framed(_json.dumps(envelope).encode()) \
+            + framed(_json.dumps({'type': 'chunk'}).encode(), chunk)
+        reader = protocol.FrameReader()
+        try:
+            reader.feed(blob)
+            raise AssertionError("the corrupt chunk must raise")
+        except BufferError as exc:
+            raise AssertionError(
+                "the corrupt chunk raised BufferError, not the clean "
+                "ValueError: {!r}".format(exc))
+        except ValueError as exc:
+            assert 'bridge' in str(exc), str(exc)
+        # no dangling exports: the buffer accepts a resize and more feed
+        del reader._buffer[:]
+        try:
+            reader.feed(framed(_json.dumps(
+                {'type': 'response', 'id': 2, 'ok': True,
+                 'blob_parts': []}).encode()))
+        except BufferError as exc:
+            raise AssertionError(
+                "the reader kept dangling exports after the corruption: "
+                "{!r}".format(exc))
+    print("  corrupt npy chunks (bad magic, declared-vs-npy mismatch): "
+          "the ONE clean ValueError, never BufferError, no dangling "
+          "exports")
+
+    # DEFECT 2: every legitimate numeric layout transfers; the wire
+    # layout always normalizes to C order
+    fortran = np.asfortranarray(
+        np.arange(24, dtype=np.float32).reshape(2, 3, 4))
+    base = np.arange(120, dtype=np.int32).reshape(10, 12)
+    strided = base[::2, ::3]
+    empty_00 = np.zeros((0, 0), dtype=np.float64)
+    empty_05 = np.zeros((0, 5), dtype=np.float64)
+    for name, sent in (('fortran-float32', fortran),
+                       ('strided-int32', strided),
+                       ('empty-0x0-float64', empty_00),
+                       ('empty-0x5-float64', empty_05)):
+        parts = []
+        marker = protocol.encode_value({'v': sent}, parts)
+        blob = protocol.encode_frame({'type': 'r', 'p': marker}, parts)
+        envelope, got_parts = protocol.FrameReader().feed(blob)[0]
+        back = protocol.decode_value(envelope['p'], got_parts)['v']
+        assert np.array_equal(back, sent) and back.dtype == sent.dtype \
+            and back.shape == sent.shape, name
+        assert back.flags['C_CONTIGUOUS'], \
+            "the transferred layout normalizes to C order ({})".format(name)
+    # the contiguous copy is accounted ONCE by the RAM gate: the F-order
+    # part's wire size equals the C-order equivalent's (the copy added
+    # no uncounted second transfer, and the parts -- not the input --
+    # are what the gate measures)
+    c_order = np.ascontiguousarray(fortran)
+    parts_f, parts_c = [], []
+    protocol.encode_value(fortran, parts_f)
+    protocol.encode_value(c_order, parts_c)
+    assert protocol.parts_wire_bytes(parts_f) == \
+        protocol.parts_wire_bytes(parts_c)
+    # the genuine refusals stand: datetime64 still refused at encode
+    try:
+        protocol.encode_value(np.array(['2020-01-01'],
+                                       dtype='datetime64[D]'), [])
+        raise AssertionError("the datetime refusal must stand")
+    except ValueError as exc:
+        assert 'datetime' in str(exc), str(exc)
+    print("  F-order / strided / (0,0) / (0,5) arrays round-trip exact "
+          "(layout normalizes to C), copy accounted, datetime refused")
+
+    # DEFECT 3: a zero-length bytes part round-trips; the marker's part
+    # index must find a materialized part (empty bytes), and a marker
+    # that references a missing part is the clean ValueError
+    parts = []
+    marker = protocol.encode_value({'data': b''}, parts)
+    assert marker == {'data': {'__dfnb__': 'bytes', 'part': 0}}, marker
+    blob = protocol.encode_frame({'type': 'request', 'id': 1,
+                                  'params': marker}, parts)
+    envelope, got_parts = protocol.FrameReader().feed(blob)[0]
+    assert got_parts == [('bytes', b'')], got_parts
+    assert protocol.decode_value(envelope['params'], got_parts) == \
+        {'data': b''}
+    # a zero-length part MIXED with a real array also survives
+    parts = []
+    marker = protocol.encode_value({'pad': b'', 'v': base}, parts)
+    blob = protocol.encode_frame({'type': 'r', 'p': marker}, parts)
+    envelope, got_parts = protocol.FrameReader().feed(blob)[0]
+    back = protocol.decode_value(envelope['p'], got_parts)
+    assert back['pad'] == b'' and np.array_equal(back['v'], base)
+    # the tombstone: a marker pointing past the parts is the clean
+    # ValueError (never the raw IndexError that escaped client.call)
+    for bad_marker in ({'__dfnb__': 'bytes', 'part': 3},
+                       {'__dfnb__': 'ndarray', 'part': -1},
+                       {'__dfnb__': 'dataframe',
+                        'columns': [{'name': 'a', 'part': 9}],
+                        'index': {'part': 0}}):
+        try:
+            protocol.decode_value(bad_marker, [])
+            raise AssertionError("the missing part must raise")
+        except IndexError as exc:
+            raise AssertionError(
+                "a missing part raised raw IndexError: {!r}".format(exc))
+        except ValueError as exc:
+            assert 'missing binary part' in str(exc), str(exc)
+    print("  zero-length bytes part round-trips (alone and mixed); a "
+          "missing-part marker is the clean ValueError, never IndexError")
+
+    # MINOR: a frame envelope that is not valid JSON is the clean
+    # ValueError carrying the cause
+    bad = framed(b'{not json')
+    try:
+        protocol.FrameReader().feed(bad)
+        raise AssertionError("the invalid JSON envelope must raise")
+    except ValueError as exc:
+        assert 'bridge frame JSON is invalid' in str(exc), str(exc)
+    print("  a raw json.JSONDecodeError becomes 'bridge frame JSON is "
+          "invalid (...)'")
 
 
 def case_bridge_pipe_name_and_version_pins():
     """The pipe name is PID-suffixed (two Dragonfly instances never
-    collide) and the protocol version is 1."""
+    collide) and the protocol version is 2 (the round-25 chunked frame
+    format; a stale peer on version 1 fails the handshake)."""
     assert protocol.BRIDGE_NAME_PREFIX == 'dfnb_bridge_'
     assert protocol.bridge_pipe_name() == \
         'dfnb_bridge_{}'.format(os.getpid()), \
         "the default pipe name carries THIS process's pid"
     assert protocol.bridge_pipe_name(4242) == 'dfnb_bridge_4242'
-    assert protocol.PROTOCOL_VERSION == 1
+    assert protocol.PROTOCOL_VERSION == 2
     print("  pipe name: 'dfnb_bridge_<pid>' pinned (default = own pid); "
-          "protocol version 1")
+          "protocol version 2")
 
 
 # ---------------------------------------------------------------------------
@@ -1029,6 +1537,57 @@ def case_client_handshake_version_and_pipe_name_pins():
     assert client_bad.is_connected() is False and not bad_events
     print("  handshake: matching WELCOME connects (+signal, name kept), "
           "mismatched version refuses")
+
+    # DEFECT 4 (round-25 attacker): a v2 client against a stale v1 peer
+    # (a reply the v2 frame reader cannot parse) fails the handshake as a
+    # clean False -- the disconnect RuntimeError _drain raises must be
+    # absorbed by the handshake phase, never raised out of connect()
+    # (the reconnect timer calls it from a Qt slot, and a slot exception
+    # can kill the process)
+
+    class _V1GarbageServer(_FakeServer):
+        """A v1-era peer: its welcome rides the pre-round-25 framing (a
+        4-byte length prefix), which the v2 reader refuses as a corrupt
+        frame -- _drain converts that to the disconnect RuntimeError."""
+
+        def pump(self):
+            del self.inbox[:]
+            welcome = json.dumps(
+                {'type': protocol.WELCOME, 'version': 1}).encode()
+            self.out += struct.pack('<I', 4 + len(welcome)) + \
+                struct.pack('<I', len(welcome)) + welcome
+
+    server_v1 = _V1GarbageServer({})
+    client_v1 = dfnb.DfnbClient(
+        pipe_name='dfnb_bridge_v1fake',
+        transport_class=type('BoundV1', (_FakeTransport,),
+                             {'server': server_v1}))
+    try:
+        assert client_v1.connect('dfnb_bridge_v1fake') is False, \
+            "a v1 peer's unparseable welcome fails the handshake cleanly"
+    except Exception as exc:
+        raise AssertionError(
+            "connect() against a v1 peer must never raise: "
+            "{!r}".format(exc))
+    assert client_v1.is_connected() is False
+    print("  a stale v1 peer: connect() returns False, never raises "
+          "(the reconnect slot stays exception-free)")
+
+    # and a CLOSED client connect()s to False (the reconnect timer fires
+    # after close() during shutdown; it must not raise into the slot --
+    # the CALL on a closed client keeps raising the clear message, pinned
+    # by the disconnect-message case)
+    client_closed, _server_closed = _make_client({'echo': _echo})
+    assert client_closed.connect('dfnb_bridge_closed') is True
+    client_closed.close()
+    try:
+        assert client_closed.connect('dfnb_bridge_closed') is False, \
+            "a closed client connect()s to False"
+    except Exception as exc:
+        raise AssertionError(
+            "connect() on a closed client must never raise: "
+            "{!r}".format(exc))
+    print("  a closed client: connect() returns False, never raises")
 
 
 def case_client_call_roundtrip_error_mapping_and_progress_pins():
@@ -2244,6 +2803,22 @@ CASES = (
      case_protocol_value_rejections_pinned),
     ("bridge protocol: frame layout + chunked reader + guards",
      case_protocol_frame_layout_and_chunked_reader_pins),
+    ("bridge protocol: chunked large-array round trip (lazy parts, "
+     "streaming npy)",
+     case_protocol_chunked_large_array_roundtrip_pins),
+    ("bridge protocol: DataFrame round trip through the chunked frames",
+     case_protocol_dataframe_chunked_roundtrip_pins),
+    ("bridge protocol: a payload over the old 1 GiB ceiling streams in "
+     "bounded chunks",
+     case_protocol_transfer_over_old_ceiling_streams_pins),
+    ("bridge protocol: the RAM feasibility gate",
+     case_protocol_ram_feasibility_gate_pins),
+    ("bridge protocol: the round-25 review hardening (header cuts, "
+     "dtype refusals, envelope cap)",
+     case_protocol_v25_p1_hardening_pins),
+    ("bridge protocol: the round-25 attacker fixes (corrupt-chunk "
+     "ValueError, array layouts, zero-length parts, JSON wrap)",
+     case_protocol_r25_attacker_fix_pins),
     ("bridge protocol: PID-suffixed pipe name + version",
      case_bridge_pipe_name_and_version_pins),
     ("dfnb client: version handshake + pipe name",

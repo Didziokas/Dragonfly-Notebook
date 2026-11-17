@@ -116,6 +116,20 @@ _NOT_AN_OBJECT_MESSAGE = (
     "the object's title or GUID as a string, or a handle returned by a "
     'dfnb publish -- an ORS object itself cannot cross the bridge.')
 
+# outbound pacing: a chunked request must never pile an unbounded number
+# of frames into QLocalSocket's internal write buffer (that would be a
+# hidden whole-transfer copy). After each frame, wait -- BOUNDED -- until
+# the buffer sinks below this water mark before writing the next one.
+# The per-wait window is short; the STALL BUDGET is the total unproductive
+# time tolerated before giving up: a busy Dragonfly (another client's long
+# handler occupying the GUI thread) legitimately stops draining the pipe
+# for tens of seconds, and a transient stall must NOT become a disconnect
+# (pre-25 the frame simply buffered). Only a genuinely disconnected socket
+# (or a stall beyond the budget) raises.
+_WRITE_WATER_BYTES = 16 * 1024 * 1024
+_WRITE_WAIT_MS = 5000
+_WRITE_STALL_BUDGET_S = 60.0
+
 
 class PublishedObject(dict):
     """The handle a ``publish_np_as_*`` returns: a ``{'guid', 'title',
@@ -313,7 +327,30 @@ class _LocalSocketTransport(object):
     def write(self, data):
         if self._socket is None:
             raise RuntimeError(_DISCONNECT_MESSAGE)
+        if not isinstance(data, bytes):
+            # PyQt6's QByteArray conversion rejects memoryview segments
+            data = bytes(data)
         self._socket.write(data)
+        stall_deadline = time.monotonic() + _WRITE_STALL_BUDGET_S
+        # pace the chunked request: keep QLocalSocket's internal write
+        # buffer bounded instead of queueing the whole transfer into it.
+        # The wait is bounded and raises a clean error on timeout (a
+        # stalled or dead pipe) rather than hanging; it never spins long
+        # in practice because the local pipe drains as Dragonfly reads.
+        while self._socket.bytesToWrite() > _WRITE_WATER_BYTES:
+            if not self._socket.waitForBytesWritten(_WRITE_WAIT_MS):
+                if self._socket.state() != \
+                        QLocalSocket.LocalSocketState.ConnectedState:
+                    raise RuntimeError(_DISCONNECT_MESSAGE)
+                if time.monotonic() > stall_deadline:
+                    raise RuntimeError(
+                        'dfnb bridge write stalled for {} s while the '
+                        'peer stayed connected; the connection was '
+                        'dropped.'.format(_WRITE_STALL_BUDGET_S))
+            else:
+                # a productive wait resets the stall budget: only
+                # CONSECUTIVE unproductive windows count against it
+                stall_deadline = time.monotonic() + _WRITE_STALL_BUDGET_S
 
     def read_available(self):
         if self._socket is None or self._socket.bytesAvailable() == 0:
@@ -444,10 +481,16 @@ class DfnbClient(QObject):
 
     def connect(self, pipe_name=None):
         """Opens the pipe and completes the version handshake. Owner thread
-        only. Returns True on success."""
+        only. Returns True on success and False on ANY connection-state
+        failure (no pipe, a closed client, a handshake-phase failure such
+        as a stale protocol-v1 peer whose reply the v2 framing cannot
+        parse, a version mismatch) -- connect NEVER raises for a
+        connection state: the form's reconnect timer calls this from a Qt
+        slot, and the round-25 attacker proved a slot exception can kill
+        the process."""
         self._check_owner_thread('connect()')
         if self._closed:
-            raise RuntimeError(_DISCONNECT_MESSAGE)
+            return False
         name = pipe_name or self._preferred_name
         if not name:
             candidates = list_pipe_candidates()
@@ -457,7 +500,14 @@ class DfnbClient(QObject):
         ok, _error = self._transport.open(name)
         if not ok:
             return False
-        if not self._handshake():
+        try:
+            handshaked = self._handshake()
+        except Exception:
+            # any handshake-phase failure (a v1 peer's reply the frame
+            # reader refuses as corruption, a dead socket mid-wait) is a
+            # clean False, never a raise into the reconnect slot
+            handshaked = False
+        if not handshaked:
             self._transport.close()
             return False
         self._preferred_name = name
@@ -478,7 +528,15 @@ class DfnbClient(QObject):
         while time.monotonic() < deadline:
             if not self._transport.is_connected:
                 return False
-            for envelope, _parts in self._drain():
+            try:
+                drained = self._drain()
+            except Exception:
+                # a reply this protocol version cannot parse (a stale v1
+                # peer's welcome arrives as corrupt v2 framing and _drain
+                # converts it to the disconnect RuntimeError) is a clean
+                # failed handshake, never a raise into the reconnect slot
+                return False
+            for envelope, _parts in drained:
                 if envelope.get('type') == protocol.WELCOME:
                     version = envelope.get('version')
                     if version != protocol.PROTOCOL_VERSION:
@@ -513,7 +571,11 @@ class DfnbClient(QObject):
             ok, _error = self._transport.open(name, timeout_s=0.75)
             if not ok:
                 continue
-            if self._handshake():
+            try:
+                handshaked = self._handshake()
+            except Exception:
+                handshaked = False
+            if handshaked:
                 self._preferred_name = name
                 self._set_connected(True)
                 return True
@@ -598,11 +660,17 @@ class DfnbClient(QObject):
             raise RuntimeError(_DISCONNECT_MESSAGE)
         seq = self._next_seq()
         parts = []
-        frame = protocol.encode_frame(
-            {'type': protocol.REQUEST, 'id': seq, 'method': method,
-             'params': protocol.encode_value(params, parts)}, parts)
+        marker = protocol.encode_value(params, parts)
+        # the send-side RAM feasibility gate: a payload that cannot fit in
+        # memory is refused HERE, before anything is written, so the
+        # connection is untouched and the error is a clean catchable
+        # RuntimeError (never the corrupt-stream disconnect path)
+        protocol.check_parts_feasibility(
+            parts, 'the {!r} request'.format(method))
+        envelope = {'type': protocol.REQUEST, 'id': seq, 'method': method,
+                    'params': marker}
         try:
-            self._transport.write(frame)
+            protocol.write_frames(envelope, parts, self._transport.write)
         except Exception:
             self._on_connection_lost()
             raise RuntimeError(_DISCONNECT_MESSAGE) from None
@@ -648,13 +716,18 @@ class DfnbClient(QObject):
 
     def _send_cancel(self, seq):
         try:
-            self._transport.write(protocol.encode_frame(
-                {'type': protocol.CANCEL, 'id': seq}))
+            protocol.write_frames(
+                {'type': protocol.CANCEL, 'id': seq}, [],
+                self._transport.write)
         except Exception:
             pass  # the connection is going away anyway
 
     def _drain(self):
-        """Reads whatever arrived, splits frames, returns the decoded ones."""
+        """Reads whatever arrived, splits frames, returns the decoded ones.
+        A ValueError (a genuinely malformed frame) kills the connection;
+        a RuntimeError (the receiver-side RAM refusal, raised by the
+        reader after it drained the announced chunks) PROPAGATES -- the
+        stream stays aligned and the connection stays alive."""
         frames = []
         data = self._transport.read_available()
         if data:

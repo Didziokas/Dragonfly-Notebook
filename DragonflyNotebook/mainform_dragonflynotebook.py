@@ -4124,13 +4124,23 @@ class DragonflyNotebookForm(QMainWindow):
         on the machine -- reopening Dragonfly reconnects the app (a
         restarted Dragonfly has a NEW pid and a new pipe name, which is
         why discovery, not just the old name). Success/failure surfaces
-        through the client's connected/disconnected signals."""
-        if self.client.is_connected():
+        through the client's connected/disconnected signals. The whole
+        body is guarded (round 25, defense in depth): the attacker proved
+        an exception escaping a Qt slot can kill the process, so NO
+        reconnect-path failure may ever -- one log line per failure
+        state, never a traceback into the slot."""
+        try:
+            if self.client.is_connected():
+                self.client.poll_reconnect()
+                return
+            if self.client.connect(self.client.pipe_name):
+                return
             self.client.poll_reconnect()
-            return
-        if self.client.connect(self.client.pipe_name):
-            return
-        self.client.poll_reconnect()
+        except Exception as exc:
+            _log.info('Dragonfly Notebook: the reconnect tick failed and '
+                      'was absorbed (the timer retries in %d ms): '
+                      '%s: %s.', _RECONNECT_INTERVAL_MS,
+                      type(exc).__name__, exc)
 
     # ------------------------------------------------- .ipynb drop target
 

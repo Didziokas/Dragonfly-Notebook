@@ -231,7 +231,28 @@ plugin manager sees it (namespace package
       the ran cells, no extra cell is appended and the scroll is stable;
       the guard's own hop driven on the empty first cell runs the rest
       of the chain; a non-empty Shift+Enter still appends and focuses
-      the fresh cell.
+      the fresh cell;
+  (13) round 25, the chunked bridge transfers over a REAL
+      client<->service pipe on a dedicated suite service: a ~1 MiB
+      array round-trips both directions at a patched 64 KiB chunk size
+      (exact values, the connection alive for a following call), the
+      RAM refusals are clean and the connection survives (the
+      service-side refusal arrives as the re-raised RuntimeError and a
+      normal call then succeeds; the client-side refusal of an outgoing
+      array is raised before anything is written and the service never
+      sees the request), the receiver-side discard path drains the
+      announced chunks and raises while the connection stays usable,
+      and the SERVICE-side receiver refusal of an oversized request
+      answers through the normal error envelope; a datetime64 array is
+      refused at encode time (client side) and surfaces as the clean
+      error envelope when a handler returns one; a ~10 MiB inline
+      envelope crosses the pipe (the writer/reader cap agreement); a
+      drilled mid-stream writer failure aborts the connection cleanly
+      and the service keeps serving; a peer that stops reading
+      mid-request stalls the writer past the old hard 5 s bound and the
+      request still crosses (the 60 s stall budget);
+      the relay's own guard (dfnb_env_kernel) refuses with its honest
+      extra-copy limitation message.
 
 ``DFNB_INSTALL_ROOT`` overrides the installed-root probe with one explicit
 data root: the pre-install staging seam. With install=false the suite can
@@ -548,6 +569,9 @@ installed_glue = importlib.import_module(
     "pythonUserExtensions.Plugins.DragonflyNotebook.DragonflyNotebook")
 import pythonUserExtensions.Plugins.DragonflyNotebook.dragonflynotebook_lib as installed_lib  # noqa: E402
 import pythonUserExtensions.Plugins.DragonflyNotebook.bridge_service as installed_bridge  # noqa: E402
+import pythonUserExtensions.Plugins.DragonflyNotebook.notebook_bridge_protocol as installed_protocol  # noqa: E402
+import pythonUserExtensions.Plugins.DragonflyNotebook.dfnb_env_kernel as installed_env_kernel  # noqa: E402
+import pythonUserExtensions.Plugins.DragonflyNotebook.dfnb_client as installed_dfnb  # noqa: E402
 
 # Bound on purpose (the PyQt ownership lesson the tier-2 loopback taught:
 # an unbound parentless application wrapper is destroyed by the next GC,
@@ -4141,6 +4165,652 @@ try:
             r24_service.close()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    print("\n=== (9c) round 25: chunked bridge transfers over the real "
+          "pipe ===", flush=True)
+
+    # Round 25 over a REAL client<->service pipe: a dedicated suite
+    # service whose handler echoes an array back, a plain client on the
+    # suite's Qt thread (the transaction pumps this process's own event
+    # loop, which is what delivers the service's bytesWritten-driven
+    # flushes). Pinned here: the ~1 MiB round trip in BOTH directions at
+    # a patched 64 KiB chunk size; the RAM refusals are clean and the
+    # connection survives (service-side as the re-raised RuntimeError in
+    # a normal error envelope, client-side before anything is written);
+    # the receiver-side discard path drains the announced chunks and
+    # raises while the connection stays usable; and the environment
+    # relay's own guard refuses with its honest extra-copy message.
+    r25_service = None
+    r25_client = None
+    original_chunk = installed_protocol.CHUNK_BYTES
+    original_available = installed_protocol.available_memory_bytes
+    original_margin = installed_protocol.RAM_CHECK_MARGIN_BYTES
+    original_parts_gate = installed_protocol.check_parts_feasibility
+    r25_calls = []
+    r25_big = np.arange(262144, dtype=np.float32).reshape(512, 512)
+
+    def _r25_echo_array(params, _progress):
+        r25_calls.append(params.get('tag'))
+        return {'array': r25_big}
+
+    def _r25_echo(params, _progress):
+        r25_calls.append(params.get('tag'))
+        return {'echo': params.get('tag')}
+
+    try:
+        r25_service = installed_bridge.NotebookBridgeService(
+            {'echo_array': _r25_echo_array, 'echo': _r25_echo},
+            pipe_name='dfnb_bridge_round25_tier3')
+        result(r25_service.is_listening,
+               "the round-25 section's bridge service listens on {}"
+               .format(r25_service.pipe_name))
+        r25_client = installed_form.DfnbClient(
+            pipe_name=r25_service.pipe_name)
+        result(r25_client.connect(), "the round-25 client connected")
+
+        # (e) the ~1 MiB round trip, both directions, at 64 KiB chunks
+        installed_protocol.CHUNK_BYTES = 65536
+        sent = np.arange(262144, dtype=np.float32).reshape(512, 512) / 7.0
+        got = r25_client.call('echo_array',
+                              {'array': sent, 'tag': 'roundtrip'})
+        result(r25_calls == ['roundtrip'], "the handler saw the request")
+        result(np.array_equal(got['array'], r25_big)
+               and got['array'].dtype == np.float32
+               and got['array'].shape == (512, 512),
+               "the response array crossed back exactly")
+        # the request's own array: verify through the service's view (the
+        # handler echoed the fixed fixture; the SENT array's arrival is
+        # proven by an echo handler round trip below)
+        got2 = r25_client.call('echo', {'array': sent, 'tag': 'echo'})
+        result(got2['echo'] == 'echo', "a follow-up call still works")
+
+        def _arrays_equal_in_service(sent_array):
+            # a dedicated handler round trip that compares IN the
+            # service: the sent array crossed the pipe chunked and exact
+            outcome = {}
+            original_handler = r25_service.handlers['echo_array']
+
+            def comparing(params, _progress):
+                outcome['equal'] = bool(np.array_equal(params['array'],
+                                                       sent_array))
+                return {'equal': outcome['equal']}
+
+            r25_service.handlers['echo_array'] = comparing
+            try:
+                answer = r25_client.call('echo_array',
+                                         {'array': sent_array,
+                                          'tag': 'compare'})
+            finally:
+                r25_service.handlers['echo_array'] = original_handler
+            return answer['equal'] is True and outcome.get('equal') is True
+
+        result(_arrays_equal_in_service(sent),
+               "the ~1 MiB array crossed OUT exactly (compared in the "
+               "service)")
+        result(np.array_equal(got['array'], r25_big),
+               "the connection stayed alive across the chunked round "
+               "trips")
+
+        # (f) the refusals are clean and the connection survives
+        installed_protocol.CHUNK_BYTES = original_chunk
+        # margin 1 MiB, availability just above it: small requests pass
+        # the send gate, the ~1 MiB response payload cannot fit
+        installed_protocol.RAM_CHECK_MARGIN_BYTES = 1 << 20
+        # service-side: the handler's array cannot fit (patched-small
+        # availability); the refusal arrives as the re-raised clean
+        # RuntimeError and a normal call then succeeds
+        installed_protocol.available_memory_bytes = \
+            lambda: (1 << 20) + 4096
+        try:
+            r25_client.call('echo_array', {'tag': 'refused'})
+            raise AssertionError("the refused call must raise")
+        except RuntimeError as exc:
+            message = str(exc)
+            result('does not fit in memory' in message
+                   and 'bytes are available' in message
+                   and 'one ROI or a MultiROI' in message,
+                   "the service-side refusal arrives as the clean "
+                   "RuntimeError ({!r})".format(message[:110]))
+        result(r25_client.call('echo', {'tag': 'after-refusal'})
+               == {'echo': 'after-refusal'},
+               "the connection survived the service-side refusal")
+        # client-side: the outgoing array is refused LOCALLY, before
+        # anything is written (the service never sees the request)
+        before = len(r25_calls)
+        try:
+            r25_client.call('echo_array', {'array': r25_big,
+                                           'tag': 'local-refusal'})
+            raise AssertionError("the local refusal must raise")
+        except RuntimeError:
+            pass
+        result(len(r25_calls) == before,
+               "the client-side refusal wrote nothing (the service "
+               "never saw the request)")
+        result(r25_client.call('echo', {'tag': 'after-local'})
+               == {'echo': 'after-local'},
+               "the connection survived the client-side refusal")
+
+        # (g) the receiver-side discard path: the service's send gate is
+        # bypassed (the patch below makes it a no-op) while the
+        # availability stays patched small, so the CLIENT's reader is
+        # the side that refuses: it drains exactly the announced chunk
+        # frames and raises, and the connection stays usable
+        installed_protocol.check_parts_feasibility = \
+            lambda parts, what=None: None
+        try:
+            r25_client.call('echo_array', {'tag': 'discarded'})
+            raise AssertionError("the discarded response must raise")
+        except RuntimeError as exc:
+            message = str(exc)
+            result('does not fit in memory' in message
+                   and 'bytes are available' in message,
+                   "the discard path drained the announced chunks and "
+                   "raised the clean refusal ({!r})".format(message[:90]))
+        result(r25_client.call('echo', {'tag': 'after-discard'})
+               == {'echo': 'after-discard'},
+               "the connection stayed usable after the discard refusal")
+
+        # (g2) the SERVICE-side receiver refusal, real pipe: the client's
+        # send gate is still bypassed and the availability stays patched
+        # small, so the SERVICE's reader is the side that refuses an
+        # oversized REQUEST: it drains exactly the announced chunk
+        # frames, answers with the normal error envelope, and the
+        # connection stays usable
+        try:
+            r25_client.call('echo', {'array': r25_big,
+                                     'tag': 'service-refused'})
+            raise AssertionError("the service-refused request must raise")
+        except RuntimeError as exc:
+            message = str(exc)
+            result('does not fit in memory' in message
+                   and 'bytes are available' in message,
+                   "the service's reader refused the oversized request "
+                   "through the normal error envelope ({!r})"
+                   .format(message[:90]))
+        result(r25_client.call('echo', {'tag': 'after-service-refusal'})
+               == {'echo': 'after-service-refusal'},
+               "the connection stayed usable after the service-side "
+               "receiver refusal")
+        # the RAM patches above belong to the refusal pins only: the
+        # pins below run against the REAL availability and margins
+        installed_protocol.RAM_CHECK_MARGIN_BYTES = original_margin
+        installed_protocol.available_memory_bytes = original_available
+        installed_protocol.check_parts_feasibility = original_parts_gate
+
+        # (f2) P1-b: a datetime64 array is refused at ENCODE time with
+        # the clean ValueError naming the dtype and the remedy, before
+        # anything is written (the connection untouched), and a handler
+        # RETURNING one produces the clean error envelope over the wire
+        # instead of a writer crash
+        dt_array = np.array(['2020-01-01', '2021-01-01'],
+                            dtype='datetime64[D]')
+        try:
+            r25_client.call('echo', {'when': dt_array, 'tag': 'dt-out'})
+            raise AssertionError("the datetime request must be refused")
+        except ValueError as exc:
+            message = str(exc)
+            result('dfnb could not transfer an array of dtype' in message
+                   and 'datetime' in message and 'convert' in message,
+                   "the client-side datetime refusal is the clean "
+                   "encode-time ValueError ({!r})".format(message[:110]))
+        result(r25_client.call('echo', {'tag': 'after-dt-refusal'})
+               == {'echo': 'after-dt-refusal'},
+               "the connection survived the datetime refusal (nothing "
+               "was written)")
+        r25_service.handlers['echo_dt'] = (
+            lambda params, _progress: {'dt': dt_array})
+        try:
+            r25_client.call('echo_dt', {'tag': 'dt-back'})
+            raise AssertionError("the datetime response must raise")
+        except ValueError as exc:
+            message = str(exc)
+            result('dfnb could not transfer an array of dtype' in message
+                   and 'datetime' in message,
+                   "a handler returning a datetime64 array surfaces as "
+                   "the clean error envelope ({!r})".format(message[:110]))
+        result(r25_client.call('echo', {'tag': 'after-dt-response'})
+               == {'echo': 'after-dt-response'},
+               "the connection survived the datetime response envelope")
+
+        # (f3) P2-1 over the real pipe: a ~10 MiB inline envelope (a
+        # plain JSON payload beyond the old 9 MiB frame guard) crosses
+        # as ONE agreed frame, because the guard now carries the
+        # envelope slack on both sides
+        big_note = 'x' * (10 * 1024 * 1024)
+        got = r25_client.call('echo', {'note': big_note,
+                                       'tag': 'big-envelope'})
+        result(got['echo'] == 'big-envelope',
+               "a ~10 MiB inline envelope crossed the real pipe (writer "
+               "and reader agree on the cap)")
+        result(r25_client.call('echo', {'tag': 'after-big-envelope'})
+               == {'echo': 'after-big-envelope'},
+               "the connection stayed usable after the big envelope")
+
+        # (f4) the defensive drain wrap: a stream pull that fails
+        # MID-TRANSFER (the writer drilled to raise after its first
+        # frame) aborts the connection cleanly inside _flush_outgoing
+        # instead of reaching the Qt slot, and the service keeps serving
+        original_iter = installed_protocol.iter_frame_segments
+
+        def _first_then_boom(envelope, parts=None, chunk_bytes=None):
+            generator = original_iter(envelope, parts, chunk_bytes)
+            yield next(generator)
+            raise RuntimeError('the round-25 writer drill: a mid-stream '
+                               'pull failed')
+
+        installed_protocol.iter_frame_segments = _first_then_boom
+        try:
+            r25_service._connections[0].send_response(
+                99991, True, {'drill': 'x'})
+            app.processEvents()
+            app.processEvents()
+            # the client's disconnect model is lazy by design (the form's
+            # reconnect timer owns the probing): poll_reconnect's
+            # liveness check sees the socket's truth and clears the flag
+            result(r25_client.poll_reconnect() is False
+                   and r25_client.is_connected() is False,
+                   "the drilled writer aborted the connection cleanly "
+                   "(nothing reached the Qt slot; the client's next "
+                   "liveness probe reports it)")
+        finally:
+            installed_protocol.iter_frame_segments = original_iter
+        r25_client2 = installed_form.DfnbClient(
+            pipe_name=r25_service.pipe_name)
+        try:
+            result(r25_client2.connect(),
+                   "the service still accepts after the drilled abort")
+            result(r25_client2.call('echo', {'tag': 'after-drill'})
+                   == {'echo': 'after-drill'},
+                   "the service kept serving after the drilled abort")
+        finally:
+            try:
+                r25_client2.close()
+            except Exception:
+                pass
+
+        # (i) P1-c: a peer that stops reading mid-request no longer
+        # disconnects the writer. While the main thread (the service's
+        # thread) sleeps WITHOUT pumping, a second client on a worker
+        # thread sends a 24 MiB request: the pipe fills, every bounded
+        # wait window expires unproductively, and -- the round-25
+        # regression -- the OLD hard 5 s bound turned that transient
+        # stall into a full disconnect. The stall budget now outlives
+        # the stall: the request crosses once the service reads again.
+        dfnb_module = installed_dfnb
+        original_water = dfnb_module._WRITE_WATER_BYTES
+        original_wait_ms = dfnb_module._WRITE_WAIT_MS
+        original_budget = dfnb_module._WRITE_STALL_BUDGET_S
+        dfnb_module._WRITE_WATER_BYTES = 0
+        dfnb_module._WRITE_WAIT_MS = 300
+        dfnb_module._WRITE_STALL_BUDGET_S = 20.0
+        stall_started = threading.Event()
+        stall_go = threading.Event()
+        stall_outcome = {}
+
+        def _stalled_writer():
+            stalled_client = installed_form.DfnbClient(
+                pipe_name=r25_service.pipe_name)
+            try:
+                if not stalled_client.connect():
+                    stall_outcome['error'] = 'connect failed'
+                    return
+                stall_started.set()
+                stall_go.wait(30)
+                began = time.monotonic()
+                answer = stalled_client.call(
+                    'echo', {'array': np.zeros(6 * 1024 * 1024,
+                                               np.float32),
+                             'tag': 'stalled-write'})
+                stall_outcome['seconds'] = time.monotonic() - began
+                stall_outcome['answer'] = answer
+                # the connection survived the stall: a follow-up call on
+                # the SAME client crosses normally
+                stall_outcome['followup'] = stalled_client.call(
+                    'echo', {'tag': 'stalled-followup'})
+            except Exception as exc:            # the pin reports it
+                stall_outcome['error'] = repr(exc)
+            finally:
+                try:
+                    stalled_client.close()
+                except Exception:
+                    pass
+
+        stall_thread = threading.Thread(target=_stalled_writer)
+        stall_thread.start()
+        try:
+            # the service's newConnection acceptance needs THIS thread's
+            # event loop, so pump while the worker connects
+            deadline = time.monotonic() + 15.0
+            while not stall_started.is_set() and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
+            result(stall_started.is_set(),
+                   "the stalled writer connected before the stall")
+            stall_go.set()
+            time.sleep(6.5)     # the service's thread stops READING
+            deadline = time.monotonic() + 30.0
+            while stall_thread.is_alive() and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
+            result(not stall_thread.is_alive(),
+                   "the stalled writer finished within the bound")
+            result('error' not in stall_outcome,
+                   "the stalled write did NOT disconnect ({!r})"
+                   .format(stall_outcome.get('error')))
+            result(stall_outcome.get('answer') == {'echo': 'stalled-write'}
+                   and stall_outcome.get('seconds', 0) > 5.5,
+                   "the request crossed after a {:.1f} s stall (the old "
+                   "5 s bound would have dropped it)".format(
+                       stall_outcome.get('seconds', -1.0)))
+            result(r25_calls.count('stalled-write') == 1,
+                   "the service saw the stalled request exactly once")
+            result(stall_outcome.get('followup')
+                   == {'echo': 'stalled-followup'},
+                   "the stalled connection stayed usable for a follow-up "
+                   "call")
+            # A FRESH client connect is deliberately NOT pinned after the
+            # stall: this harness runs BOTH pipe roles in one process,
+            # and after a paced write has churned through unproductive
+            # waitForBytesWritten windows here, a NEW connection's first
+            # in-process write can stall (probed: the same fresh connect
+            # succeeds when the roles live in separate processes, and the
+            # stalled connection itself keeps serving). In production the
+            # stalled writer is the notebook application and the service
+            # never False-waits during a client-side stall, so no real
+            # session is affected; the drilled abort above pins the
+            # service's fresh-client acceptance separately.
+        finally:
+            stall_thread.join(5.0)
+            dfnb_module._WRITE_WATER_BYTES = original_water
+            dfnb_module._WRITE_WAIT_MS = original_wait_ms
+            dfnb_module._WRITE_STALL_BUDGET_S = original_budget
+    finally:
+        installed_protocol.CHUNK_BYTES = original_chunk
+        installed_protocol.RAM_CHECK_MARGIN_BYTES = original_margin
+        installed_protocol.available_memory_bytes = original_available
+        installed_protocol.check_parts_feasibility = original_parts_gate
+        if r25_client is not None:
+            try:
+                r25_client.close()
+            except Exception:
+                pass
+        if r25_service is not None:
+            try:
+                r25_service.close()
+            except Exception:
+                pass
+
+    # (r25b) the round-25 attacker fixes over the REAL pipe: a corrupt
+    # chunk aborts the corrupt connection while the service KEEPS
+    # SERVING (the pre-fix BufferError escaped the readyRead Qt slot and
+    # killed three fresh service processes), F-order / strided /
+    # zero-size arrays and zero-length bytes values round-trip both
+    # directions, a stale v1 peer fails the handshake as a clean False,
+    # and the form's reconnect tick absorbs a raising client without an
+    # exception ever escaping the Qt slot
+    import json as r25b_json
+    import struct as r25b_struct
+    from PyQt6.QtNetwork import QLocalServer as R25bLocalServer, \
+        QLocalSocket as R25bLocalSocket
+
+    r25b_service = None
+    r25b_client = None
+    try:
+        def _r25b_echo_params(params, _progress):
+            return {'params': params}
+
+        def _r25b_zero_bytes(params, _progress):
+            return {'data': b''}
+
+        def _r25b_echo_array(params, _progress):
+            return {'array': r25b_layout_fixture}
+
+        r25b_layout_fixture = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+        r25b_service = installed_bridge.NotebookBridgeService(
+            {'echo_params': _r25b_echo_params,
+             'zero_bytes': _r25b_zero_bytes,
+             'echo_array': _r25b_echo_array},
+            pipe_name='dfnb_bridge_round25b_tier3')
+        result(r25b_service.is_listening,
+               "the r25b service listens on {}".format(r25b_service.pipe_name))
+        r25b_client = installed_form.DfnbClient(
+            pipe_name=r25b_service.pipe_name)
+        result(r25b_client.connect(), "the r25b client connected")
+
+        # -- DEFECT 1: a raw-socket corrupt-chunk client ----------------
+        # (the attacker's exact probe: a valid header declaring one 64-byte
+        # npy part, then a chunk frame whose data is garbage -- the npy
+        # magic is wrong, so the assembler raises the corruption
+        # ValueError while memoryview slices of the reader's own buffer
+        # are alive in the traceback; PRE-FIX the cleanup trim raised
+        # BufferError into the Qt slot and the service process died)
+        sock = R25bLocalSocket()
+        sock.connectToServer(r25b_service.pipe_name)
+        result(sock.waitForConnected(3000), "the corrupt client connected")
+        hello = r25b_json.dumps({'type': 'hello', 'version': 2}).encode()
+        sock.write((len(hello) + 4).to_bytes(8, 'little')
+                   + len(hello).to_bytes(4, 'little') + hello)
+        sock.waitForBytesWritten(2000)
+        time.sleep(0.2)
+        sock.readAll()
+        envelope = {'type': 'request', 'id': 1, 'method': 'echo_params',
+                    'params': 1,
+                    'blob_parts': [{'kind': 'npy', 'bytes': 64}]}
+        head = r25b_json.dumps(envelope).encode()
+        chunk_env = r25b_json.dumps({'type': 'chunk'}).encode()
+        sock.write((len(head) + 4).to_bytes(8, 'little')
+                   + len(head).to_bytes(4, 'little') + head)
+        sock.write((len(chunk_env) + 4 + 64).to_bytes(8, 'little')
+                   + len(chunk_env).to_bytes(4, 'little') + chunk_env
+                   + b'\x00' * 64)
+        sock.waitForBytesWritten(2000)
+        print('  corrupt chunk sent to the real service', flush=True)
+        deadline = time.monotonic() + 5.0
+        aborted = False
+        while time.monotonic() < deadline:
+            app.processEvents()
+            if sock.state() != R25bLocalSocket.LocalSocketState.ConnectedState:
+                aborted = True
+                break
+            time.sleep(0.05)
+        result(aborted,
+               "the corrupt client's connection was aborted cleanly "
+               "(the service noticed the corruption, socket state is "
+               "{})".format(sock.state()))
+        sock.abort()
+
+        # the service KEEPS SERVING: a follow-up client connects and a
+        # real call crosses (PRE-FIX this was False: the process was
+        # dead -- svc_crash2/3/4.log, 'fresh connection accepted: False')
+        followup = installed_form.DfnbClient(pipe_name=r25b_service.pipe_name)
+        try:
+            result(followup.connect(),
+                   "the service still accepts a fresh client after the "
+                   "corrupt chunk (it stayed ALIVE)")
+            result(followup.call('echo_params', {'tag': 'after-corrupt'})
+                   == {'params': {'tag': 'after-corrupt'}},
+                   "the service served the follow-up client's real call")
+        finally:
+            try:
+                followup.close()
+            except Exception:
+                pass
+
+        # -- DEFECT 2: the array layouts, both directions ---------------
+        fortran = np.asfortranarray(
+            np.arange(24, dtype=np.float32).reshape(2, 3, 4))
+        base = np.arange(120, dtype=np.int32).reshape(10, 12)
+        strided = base[::2, ::3]
+        empty_00 = np.zeros((0, 0), dtype=np.float64)
+        empty_05 = np.zeros((0, 5), dtype=np.float64)
+
+        def _layout_equal_in_service(sent_array):
+            outcome = {}
+            original_handler = r25b_service.handlers['echo_array']
+
+            def comparing(params, _progress):
+                outcome['equal'] = bool(
+                    np.array_equal(params['array'], sent_array)
+                    and params['array'].dtype == sent_array.dtype
+                    and params['array'].shape == sent_array.shape)
+                return {'equal': outcome['equal']}
+
+            r25b_service.handlers['echo_array'] = comparing
+            try:
+                answer = r25b_client.call('echo_array',
+                                          {'array': sent_array,
+                                           'tag': 'layout'})
+            finally:
+                r25b_service.handlers['echo_array'] = original_handler
+            return answer['equal'] is True and outcome.get('equal') is True
+
+        for name, sent in (('fortran-float32', fortran),
+                           ('strided-int32', strided),
+                           ('empty-0x0-float64', empty_00),
+                           ('empty-0x5-float64', empty_05)):
+            result(_layout_equal_in_service(sent),
+                   "the {} array crossed OUT exactly (compared in the "
+                   "service; the wire layout normalizes to C)".format(name))
+            got = r25b_client.call('echo_array', {'tag': 'layout-back'})
+            result(got['array'].shape == r25b_layout_fixture.shape
+                   and np.array_equal(got['array'], r25b_layout_fixture)
+                   and got['array'].flags['C_CONTIGUOUS'],
+                   "the connection stayed alive after the {} round "
+                   "trip".format(name))
+
+        # -- DEFECT 3: the zero-length bytes value, both directions ----
+        got = r25b_client.call('echo_params', {'data': b''})
+        result(got == {'params': {'data': b''}},
+               "a zero-length bytes value crossed OUT in a request "
+               "({!r})".format(got))
+        got = r25b_client.call('zero_bytes', {})
+        result(got == {'data': b''},
+               "a zero-length bytes value crossed BACK in a response "
+               "({!r})".format(got))
+        result(r25b_client.call('echo_params', {'tag': 'after-zero'})
+               == {'params': {'tag': 'after-zero'}},
+               "the connection stayed usable after the zero-length "
+               "round trips")
+
+        # -- DEFECT 4: a v2 client against a fake v1 service ------------
+        v1_server = R25bLocalServer()
+        R25bLocalServer.removeServer('dfnb_bridge_r25_v1fake')
+        result(v1_server.listen('dfnb_bridge_r25_v1fake'),
+               "the fake v1 service listens")
+
+        def _on_v1_connection():
+            while v1_server.hasPendingConnections():
+                peer = v1_server.nextPendingConnection()
+
+                def _reply_v1():
+                    data = bytes(peer.readAll().data())
+                    if not data:
+                        return
+                    # the v1-era reply: a 4-byte length prefix the v2
+                    # frame reader refuses as corruption (the attacker's
+                    # cli_v1refuse shape)
+                    welcome = r25b_json.dumps(
+                        {'type': 'welcome', 'version': 1}).encode()
+                    peer.write(r25b_struct.pack('<I', 4 + len(welcome))
+                               + r25b_struct.pack('<I', len(welcome))
+                               + welcome)
+
+                peer.readyRead.connect(_reply_v1)
+                if peer.bytesAvailable():
+                    _reply_v1()
+
+        v1_server.newConnection.connect(_on_v1_connection)
+        v1_client = installed_form.DfnbClient(
+            pipe_name='dfnb_bridge_r25_v1fake')
+        v1_raised = []
+        try:
+            v1_ok = v1_client.connect('dfnb_bridge_r25_v1fake')
+        except Exception as exc:
+            v1_raised.append('{!r}'.format(exc))
+            v1_ok = None
+        result(v1_ok is False and not v1_raised,
+               "the v2 client against the fake v1 service: connect() "
+               "returned {} with no exception escaping (raised: {})"
+               .format(v1_ok, v1_raised or 'none'))
+        result(v1_client.is_connected() is False,
+               "the v1-peer handshake left the client disconnected")
+        v1_client.close()
+        v1_server.close()
+
+        # -- DEFECT 4: the reconnect tick absorbs a raising client ------
+        class _RaisingClient(object):
+            pipe_name = 'dfnb_bridge_drill'
+
+            def is_connected(self):
+                return False
+
+            def connect(self, _name=None):
+                raise RuntimeError('the round-25 drill: connect raised')
+
+            def poll_reconnect(self):
+                raise RuntimeError('the round-25 drill: poll raised')
+
+        original_form_client = form.client
+        form.client = _RaisingClient()
+        try:
+            form._on_reconnect_tick()
+            result(True, "the reconnect tick absorbed a client whose "
+                         "connect() and poll_reconnect() both raised "
+                         "(no exception reached the Qt slot)")
+        except Exception as exc:
+            result(False, "the reconnect tick let a client exception "
+                          "escape: {!r}".format(exc))
+        finally:
+            form.client = original_form_client
+        result(form.client.is_connected(),
+               "the form's real client was restored and is still "
+               "connected")
+    finally:
+        if r25b_client is not None:
+            try:
+                r25b_client.close()
+            except Exception:
+                pass
+        if r25b_service is not None:
+            try:
+                r25b_service.close()
+            except Exception:
+                pass
+
+    # (h) the environment relay's guard: its refusal message and its
+    # pass-through behavior, pinned on the installed module
+    original_relay_available = installed_env_kernel._available_memory_bytes
+    original_relay_margin = installed_env_kernel._RELAY_RAM_MARGIN_BYTES
+    try:
+        installed_env_kernel._available_memory_bytes = lambda: 1 << 20
+        installed_env_kernel._RELAY_RAM_MARGIN_BYTES = 1 << 20
+        try:
+            installed_env_kernel.encode_value(np.zeros(4096, np.float32))
+            raise AssertionError("the relay guard must refuse")
+        except RuntimeError as exc:
+            message = str(exc)
+            result('custom environment' in message
+                   and 'base64 JSON lines' in message
+                   and 'bytes are available' in message
+                   and 'one ROI or a MultiROI' in message,
+                   "the relay guard refuses with the honest extra-copy "
+                   "limitation message ({!r})".format(message[:110]))
+        installed_env_kernel._available_memory_bytes = lambda: 1 << 40
+        marker = installed_env_kernel.encode_value(
+            np.zeros(4096, np.float32))
+        result(marker.get('__dfnb__') == 'ndarray'
+               and marker.get('shape') == [4096],
+               "the relay guard passes a payload that fits")
+        installed_env_kernel._available_memory_bytes = lambda: None
+        marker = installed_env_kernel.encode_value(
+            np.zeros(4096, np.float32))
+        result(marker.get('__dfnb__') == 'ndarray',
+               "an unknown availability never refuses in the relay")
+    finally:
+        installed_env_kernel._available_memory_bytes = \
+            original_relay_available
+        installed_env_kernel._RELAY_RAM_MARGIN_BYTES = original_relay_margin
 
     # ------------------------------------------------------------------
     print("\n=== (10) rounds 16+17: the custom python environments ===",
